@@ -1,0 +1,28 @@
+# Dependencias y compilación
+target/
+Cargo.lock
+
+# IDEs y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Archivos de entorno
+.env
+.env.local
+.env.*.local
+
+# Datos y archivos generados
+data/
+*.csv
+*.json
+*.db
+*.sqlite
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db

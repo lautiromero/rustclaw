@@ -1,0 +1,35 @@
+use anyhow::{Context, Result};
+
+pub struct Config {
+    pub nvidia_api_key: String,
+    pub nvidia_base_url: String,
+    pub llm_model: String,
+    pub embedding_model: String,
+    pub embedding_base_url: String,
+    pub database_url: String,
+    pub max_context: usize,
+}
+
+impl Config {
+    pub fn load() -> Result<Self> {
+        dotenvy::dotenv().ok();
+        Ok(Self {
+            nvidia_api_key: std::env::var("NVIDIA_API_KEY")
+                .context("Falta NVIDIA_API_KEY")?,
+            nvidia_base_url: std::env::var("NVIDIA_BASE_URL")
+                .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".into()),
+            llm_model: std::env::var("LLM_MODEL")
+                .unwrap_or_else(|_| "nvidia/llama-3.1-70b-instruct".into()),
+            embedding_model: std::env::var("EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".into()),
+            embedding_base_url: std::env::var("EMBEDDING_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/v1".into()),
+            database_url: std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "sqlite:./data/agent.db?mode=rwc".into()),
+            max_context: std::env::var("MAX_CONTEXT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+        })
+    }
+}
