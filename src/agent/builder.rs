@@ -47,11 +47,11 @@ where
         .dynamic_context(config.max_context, index)
         .temperature(0.2)
         .max_tokens(400)
-        .additional_params(json!({"top_p": 0.95}))
+        .additional_params(json!({"top_p": 0.9}))
         .tool(crate::tools::web::katana::KatanaTool::new())
         .tool(save_tool)
         .tool(recall_tool)
-        .default_max_turns(3)
+        .default_max_turns(5)
         .build();
 
     tracing::info!(

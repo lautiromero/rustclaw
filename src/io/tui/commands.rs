@@ -1,8 +1,8 @@
 #[derive(Debug, Clone)]
 pub enum Command {
     NewSession,
-    ListSessions { limit: Option<usize> },
-    SwitchSession { id: String },
+    // ListSessions { limit: Option<usize> },
+    // SwitchSession { id: String },
     Clear,
     Copy { target: String },
     Accept,
@@ -24,10 +24,10 @@ pub fn parse(input: &str) -> Command {
         let parts: Vec<&str> = trimmed[1..].split_whitespace().collect();
         match parts.first().copied() {
             Some("new") => Command::NewSession,
-            Some("list") => Command::ListSessions { limit: None },
-            Some("switch") if parts.len() > 1 => Command::SwitchSession {
-                id: parts[1].to_string(),
-            },
+            // Some("list") => Command::ListSessions { limit: None },
+            // Some("switch") if parts.len() > 1 => Command::SwitchSession {
+            //     id: parts[1].to_string(),
+            // },
             Some("clear") => Command::Clear,
             Some("copy") if parts.len() > 1 => Command::Copy {
                 target: parts[1..].join(" "),

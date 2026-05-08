@@ -1,4 +1,3 @@
-use crate::context::injector::ContextInjector;
 use crate::io::tui::app::TuiApp;
 use crate::io::tui::commands::Command;
 use crate::io::tui::render::render;
@@ -6,18 +5,17 @@ use crate::memory::session_store::SessionStore;
 use crate::memory::sqlite::MemoryDB;
 use crate::state::conversation::{MessageRole, UiMessage};
 use anyhow::Result;
-use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableMouseCapture;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use crossterm::event::{DisableMouseCapture, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui_textarea::Input;
-use rig::embeddings::EmbeddingModel;
 use std::io;
 use std::sync::Arc;
 
@@ -69,28 +67,8 @@ where
                 continue;
             }
 
-            // Toggle mouse capture con Alt+M
-            if let crossterm::event::Event::Key(key_event) = &crossterm_event {
-                use crossterm::event::{KeyCode, KeyModifiers};
-                if key_event.code == KeyCode::Char('m')
-                    && key_event.modifiers.contains(KeyModifiers::ALT)
-                    && key_event.kind == crossterm::event::KeyEventKind::Press
-                {
-                    app.mouse_capture_enabled = !app.mouse_capture_enabled;
-                    if app.mouse_capture_enabled {
-                        let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                        app.status = "🖱️ Scroll ON (Alt+M)".to_string();
-                    } else {
-                        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                        app.status = "🖱️ Select ON (Alt+M)".to_string();
-                    }
-                    continue;
-                }
-            }
-
-            // Scroll con rueda del mouse (solo si captura activa)
             if let crossterm::event::Event::Mouse(mouse_event) = &crossterm_event {
-                use crossterm::event::MouseEventKind;
+                use crossterm::event::{MouseButton, MouseEventKind};
                 if app.mouse_capture_enabled {
                     match mouse_event.kind {
                         MouseEventKind::ScrollUp => {
@@ -102,9 +80,26 @@ where
                             app.conversation.scroll_offset =
                                 app.conversation.scroll_offset.saturating_add(3);
                         }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // ← Click en modo scroll → cambia a selección nativa
+                            app.mouse_capture_enabled = false;
+                            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                        }
                         _ => {}
                     }
                 }
+                continue;
+            }
+
+            // ← Manejo de teclas (solo para Esc en modo nativo)
+            if let crossterm::event::Event::Key(key_event) = &crossterm_event
+                && key_event.kind == crossterm::event::KeyEventKind::Press
+                && !app.mouse_capture_enabled
+                && key_event.code == KeyCode::Esc
+            {
+                // ← Esc en modo nativo → vuelve a scroll
+                app.mouse_capture_enabled = true;
+                let _ = execute!(std::io::stdout(), EnableMouseCapture);
                 continue;
             }
 
@@ -117,6 +112,27 @@ where
                     ..
                 } => {
                     app.quit = true;
+                }
+                Input {
+                    key: ratatui_textarea::Key::Char('e'),
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    ..
+                } => {
+                    // Exportar conversación actual a Markdown
+                    let md_content = app.export_conversation_to_markdown();
+
+                    // Suspender TUI y lanzar editor
+                    let _ = crate::utils::visual_mode::run_visual_mode(
+                        &mut terminal,
+                        &md_content,
+                        None,
+                    );
+
+                    app.mouse_capture_enabled = true;
+                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                    continue;
                 }
                 Input {
                     key: ratatui_textarea::Key::Char('c'),

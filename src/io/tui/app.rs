@@ -1,5 +1,4 @@
 use crate::io::tui::commands::{Command, parse};
-use crate::memory::session_store::SessionStore;
 use crate::state::conversation::{ConversationState, MessageRole, UiMessage};
 use ratatui_textarea::TextArea;
 use rig::completion::Chat;
@@ -275,5 +274,9 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    pub fn export_conversation_to_markdown(&self) -> String {
+        crate::utils::visual_mode::export_conversation_to_markdown(&self.conversation.messages)
     }
 }

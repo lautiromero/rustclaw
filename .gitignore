@@ -26,3 +26,6 @@ data/
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Personal notes
+*.txt

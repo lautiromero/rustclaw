@@ -75,9 +75,37 @@ pub fn render(frame: &mut Frame, app: &TuiApp) {
     frame.render_widget(&app.input, input_block.inner(input_area));
 
     // Status bar
-    let status_text = app.status.chars().take(100).collect::<String>();
-    let status_paragraph = Paragraph::new(format!(" {}", status_text))
-        .style(Style::new().bg(Color::DarkGray).fg(Color::White))
+    // Status bar estructurado: Active: [Mode] │ hints estáticos
+    let mode_text = if app.mouse_capture_enabled {
+        "Scroll Mode"
+    } else {
+        "Select Mode"
+    };
+
+    // Construir línea con segmentos estilizados
+    let line = Line::from(vec![
+        // "Active: " estático en gris medio
+        Span::styled("Active: ", Style::new().fg(Color::Rgb(150, 150, 150))),
+        // Modo actual (dinámico) en blanco
+        Span::styled(
+            mode_text,
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        // Separador
+        Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
+        // Hint Click/Esc estático en cyan suave
+        Span::styled("Click/Esc ", Style::new().fg(Color::Rgb(100, 180, 220))),
+        // Separador
+        Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
+        // Hint Visual Mode estático en verde suave
+        Span::styled(
+            "Ctrl+E > Visual",
+            Style::new().fg(Color::Rgb(120, 200, 150)),
+        ),
+    ]);
+
+    let status_paragraph = Paragraph::new(line)
+        .style(Style::new().bg(Color::Rgb(35, 35, 35)))
         .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(status_paragraph, status_area);
