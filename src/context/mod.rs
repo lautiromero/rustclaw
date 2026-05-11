@@ -1,5 +1,5 @@
 pub mod chunker;
-pub mod loader;
+pub mod file_loader;
 pub mod injector;
 pub mod vector_store;
 

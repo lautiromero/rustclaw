@@ -8,14 +8,17 @@ pub struct Config {
     pub embedding_base_url: String,
     pub database_url: String,
     pub max_context: usize,
+
+    // Control de timeout dinámico
+    pub max_turns: u64, // Máx. iteraciones internas por mensaje del usuario
+    pub timeout_base_secs: u64, // Timeout base por iteración (en segundos)
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
         dotenvy::dotenv().ok();
         Ok(Self {
-            nvidia_api_key: std::env::var("NVIDIA_API_KEY")
-                .context("Falta NVIDIA_API_KEY")?,
+            nvidia_api_key: std::env::var("NVIDIA_API_KEY").context("Falta NVIDIA_API_KEY")?,
             nvidia_base_url: std::env::var("NVIDIA_BASE_URL")
                 .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".into()),
             llm_model: std::env::var("LLM_MODEL")
@@ -30,6 +33,16 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
+
+            max_turns: std::env::var("AGENT_MAX_TURNS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5), // Default iteraciones máx. por mensaje
+
+            timeout_base_secs: std::env::var("AGENT_TIMEOUT_BASE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(40), // Default por iteración
         })
     }
 }

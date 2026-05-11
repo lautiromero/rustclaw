@@ -1,5 +1,9 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{EnvFilter, fmt};
+
+const DEBUG_LOG_PATH: &str = "/tmp/rustclaw-debug.log";
 
 pub fn init_tracing(verbose: bool, to_stderr: bool) -> anyhow::Result<()> {
     // silenciar arboard + subir nivel a ERROR en TUI mode
@@ -24,4 +28,20 @@ pub fn init_tracing(verbose: bool, to_stderr: bool) -> anyhow::Result<()> {
         .with_writer(writer)
         .init();
     Ok(())
+}
+
+pub fn debug_log(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DEBUG_LOG_PATH)
+    {
+        let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(file, "[{}] {}", timestamp, msg);
+    }
+}
+
+/// Limpia el archivo log (útil al iniciar o para rotar manualmente)
+pub fn clear_debug_log() {
+    let _ = std::fs::remove_file(DEBUG_LOG_PATH);
 }

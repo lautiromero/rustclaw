@@ -56,12 +56,12 @@ where
     );
 
     loop {
-        terminal.draw(|f| render(f, &app))?;
+        // ← IMPORTANTE: render ahora toma &mut app
+        terminal.draw(|f| render(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             let crossterm_event = event::read()?;
 
-            // Handle Paste
             if let crossterm::event::Event::Paste(text) = crossterm_event {
                 app.input.insert_str(&text);
                 continue;
@@ -73,15 +73,17 @@ where
                     match mouse_event.kind {
                         MouseEventKind::ScrollUp => {
                             app.conversation.auto_scroll = false;
-                            app.conversation.scroll_offset =
-                                app.conversation.scroll_offset.saturating_sub(3);
+                            // ← FIX: Usar métodos de ScrollbarState (mismo ritmo que antes)
+                            app.vertical_scroll.prev();
+                            app.vertical_scroll.prev();
+                            app.vertical_scroll.prev();
                         }
                         MouseEventKind::ScrollDown => {
-                            app.conversation.scroll_offset =
-                                app.conversation.scroll_offset.saturating_add(3);
+                            app.vertical_scroll.next();
+                            app.vertical_scroll.next();
+                            app.vertical_scroll.next();
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // ← Click en modo scroll → cambia a selección nativa
                             app.mouse_capture_enabled = false;
                             let _ = execute!(std::io::stdout(), DisableMouseCapture);
                         }
@@ -91,19 +93,16 @@ where
                 continue;
             }
 
-            // ← Manejo de teclas (solo para Esc en modo nativo)
             if let crossterm::event::Event::Key(key_event) = &crossterm_event
                 && key_event.kind == crossterm::event::KeyEventKind::Press
                 && !app.mouse_capture_enabled
                 && key_event.code == KeyCode::Esc
             {
-                // ← Esc en modo nativo → vuelve a scroll
                 app.mouse_capture_enabled = true;
                 let _ = execute!(std::io::stdout(), EnableMouseCapture);
                 continue;
             }
 
-            // Resto de eventos de teclado → TextArea / submit
             match crossterm_event.into() {
                 Input {
                     key: ratatui_textarea::Key::Char('c'),
@@ -120,16 +119,12 @@ where
                     alt: false,
                     ..
                 } => {
-                    // Exportar conversación actual a Markdown
                     let md_content = app.export_conversation_to_markdown();
-
-                    // Suspender TUI y lanzar editor
                     let _ = crate::utils::visual_mode::run_visual_mode(
                         &mut terminal,
                         &md_content,
                         None,
                     );
-
                     app.mouse_capture_enabled = true;
                     let _ = execute!(std::io::stdout(), EnableMouseCapture);
                     continue;
@@ -139,9 +134,7 @@ where
                     ctrl: true,
                     shift: true,
                     ..
-                } => {
-                    // No-op: terminal maneja copy nativo
-                }
+                } => {}
                 Input {
                     key: ratatui_textarea::Key::Enter,
                     shift: false,
@@ -149,12 +142,14 @@ where
                     ctrl: false,
                     ..
                 } => {
+                    if app.pending_response {
+                        continue;
+                    }
+
                     if let Some(cmd) = app.handle_submit() {
                         match cmd {
                             Command::Message(msg) => {
-                                // ← Inyección de contexto semántico
                                 let enriched = if let Some(ref injector) = context_injector {
-                                    // build_context retorna String directo, no Result
                                     let ctx = tokio::task::block_in_place(|| {
                                         tokio::runtime::Handle::current()
                                             .block_on(injector.build_context(&msg, 3))
@@ -174,7 +169,9 @@ where
                     }
                 }
                 input => {
-                    app.input.input(input);
+                    if !app.pending_response {
+                        app.input.input(input);
+                    }
                 }
             }
 
@@ -199,7 +196,6 @@ where
     Ok(())
 }
 
-// ← Helper para cargar mensajes de la sesión (sync wrapper)
 fn load_session_messages(
     memory_db: &MemoryDB,
     session_id: &str,
@@ -209,7 +205,6 @@ fn load_session_messages(
     let mut ui_messages = Vec::new();
     let mut rig_messages = Vec::new();
 
-    // block_in_place para llamar async desde sync
     let db_msgs = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(memory_db.load_session(session_id))
     });
@@ -237,7 +232,6 @@ fn load_session_messages(
     (ui_messages, rig_messages)
 }
 
-// ← Helper para extraer texto de RigMessage
 fn extract_text_from_rig(msg: &rig::completion::Message) -> String {
     use rig::completion::Message as RigMessage;
 

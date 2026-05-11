@@ -46,7 +46,7 @@ where
 - Respond naturally to greetings and general questions without using tools.")
         .dynamic_context(config.max_context, index)
         .temperature(0.2)
-        .max_tokens(400)
+        .max_tokens(8000)
         .additional_params(json!({"top_p": 0.9}))
         .tool(crate::tools::web::katana::KatanaTool::new())
         .tool(save_tool)
