@@ -64,3 +64,12 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX idx_messages_timestamp ON messages(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS file_cache (
+    session_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    last_accessed INTEGER NOT NULL,
+    PRIMARY KEY (session_id, file_path)
+);

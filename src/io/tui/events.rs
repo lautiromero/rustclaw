@@ -19,15 +19,11 @@ use ratatui_textarea::Input;
 use std::io;
 use std::sync::Arc;
 
-pub fn run_tui<M>(
+pub fn run_tui(
     agent: crate::agent::AppAgent,
     memory_db: Arc<crate::memory::sqlite::MemoryDB>,
     session_id: String,
-    context_injector: Option<crate::context::injector::ContextInjector<M>>,
-) -> Result<()>
-where
-    M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
-{
+) -> Result<()> {
     let mut stdout = io::stdout();
 
     execute!(
@@ -149,20 +145,21 @@ where
                     if let Some(cmd) = app.handle_submit() {
                         match cmd {
                             Command::Message(msg) => {
-                                let enriched = if let Some(ref injector) = context_injector {
-                                    let ctx = tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current()
-                                            .block_on(injector.build_context(&msg, 3))
-                                    });
-                                    if !ctx.trim().is_empty() {
-                                        format!("{}\n\n{}", msg, ctx)
-                                    } else {
-                                        msg
-                                    }
-                                } else {
-                                    msg
-                                };
-                                app.send_to_agent(enriched);
+                                // let enriched = if let Some(ref injector) = context_injector {
+                                //     let ctx = tokio::task::block_in_place(|| {
+                                //         tokio::runtime::Handle::current()
+                                //             .block_on(injector.build_context(&msg, 3))
+                                //     });
+                                //     if !ctx.trim().is_empty() {
+                                //         format!("{}\n\n{}", msg, ctx)
+                                //     } else {
+                                //         msg
+                                //     }
+                                // } else {
+                                //     msg
+                                // };
+                                // app.send_to_agent(enriched);
+                                app.send_to_agent(msg);
                             }
                             cmd => app.execute(cmd),
                         }

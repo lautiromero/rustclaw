@@ -124,16 +124,39 @@ pub fn discover_files(prefix: &str) -> Result<Vec<String>> {
 pub fn extract_file_references(input: &str) -> Vec<String> {
     let mut refs = Vec::new();
 
-    // Buscar patrones @path/to/file
-    for token in input.split_whitespace() {
-        if token.starts_with('@') && token.len() > 1 {
-            let path = &token[1..]; // Quitar @
-            // Validar que parezca un path razonable (no solo @)
-            if !path.is_empty() && !path.ends_with('/') {
-                refs.push(path.to_string());
+    // Buscar patrones @path/to/file (soporta espacios si están entre comillas)
+    let mut in_quotes = false;
+    let mut current_ref = String::new();
+
+    for ch in input.chars() {
+        match ch {
+            '@' if !in_quotes => {
+                if !current_ref.is_empty() {
+                    refs.push(current_ref.clone());
+                    current_ref.clear();
+                }
             }
+            '"' => {
+                in_quotes = !in_quotes;
+                if !in_quotes && !current_ref.is_empty() {
+                    refs.push(current_ref.clone());
+                    current_ref.clear();
+                }
+            }
+            ' ' if !in_quotes => {
+                if current_ref.starts_with('@') && current_ref.len() > 1 {
+                    refs.push(current_ref[1..].to_string());
+                }
+                current_ref.clear();
+            }
+            _ => current_ref.push(ch),
         }
     }
 
-    refs
+    // Capturar último reference si existe
+    if current_ref.starts_with('@') && current_ref.len() > 1 {
+        refs.push(current_ref[1..].to_string());
+    }
+
+    refs.into_iter().filter(|p| !p.is_empty()).collect()
 }

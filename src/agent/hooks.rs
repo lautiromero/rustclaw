@@ -1,8 +1,4 @@
-use anyhow::Result;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc;
 
 // Evento que el agente emite hacia la UI/DB

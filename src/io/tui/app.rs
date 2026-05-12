@@ -29,7 +29,7 @@ pub struct TuiApp {
     pub session_id: String,
     pub memory_db: Arc<crate::memory::sqlite::MemoryDB>,
 
-    // ← NUEVO: Estado del scrollbar (fuente de verdad para scroll vertical)
+    // Estado del scrollbar (fuente de verdad para scroll vertical)
     pub vertical_scroll: ScrollbarState,
 }
 
@@ -126,16 +126,53 @@ impl TuiApp {
         self.conversation.scroll_offset = 0;
 
         let file_refs = crate::context::file_loader::extract_file_references(&clean_message);
-        let mut enriched_prompt = trimmed.clone();
+        let mut enriched_prompt = clean_message.clone();
         let mut files_loaded = 0;
 
         for file_path in &file_refs {
-            if let Ok(content) = crate::context::file_loader::read_file_text(file_path) {
-                enriched_prompt
-                    .push_str(&format!("\n\n[FILE: {}]\n{}\n[/FILE]", file_path, content));
-                files_loaded += 1;
-            }
+            // Puente sync→async (ya lo usabas, se mantiene igual)
+            let cached = {
+                let db = self.memory_db.clone();
+                let session = self.session_id.clone();
+                let path = file_path.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::context::file_cache::try_get_cached(&db, &session, &path),
+                    )
+                })
+                .unwrap_or(None)
+            };
+
+            let content = match cached {
+                Some(c) => {
+                    crate::utils::debug_log(&format!("🗃️ UI cache HIT: {}", file_path));
+                    c
+                }
+                None => match crate::context::file_loader::read_file_text(file_path) {
+                    Ok(c) => {
+                        let db = self.memory_db.clone();
+                        let s = self.session_id.clone();
+                        let p = file_path.clone();
+                        let c_clone = c.clone();
+                        tokio::spawn(async move {
+                            crate::context::file_cache::store_in_cache(&db, &s, &p, &c_clone).await;
+                        });
+                        crate::utils::debug_log(&format!("💾 UI cache STORED: {}", file_path));
+                        c
+                    }
+                    Err(_) => continue,
+                },
+            };
+
+            enriched_prompt.push_str(&format!("\n\n[FILE: {}]\n{}\n[/FILE]", file_path, content));
+            files_loaded += 1;
         }
+
+        crate::utils::debug_log(&format!(
+            "📤 Files injected: {:?}, Prompt: {} chars",
+            file_refs,
+            enriched_prompt.len()
+        ));
 
         self.conversation.messages.push(UiMessage {
             role: MessageRole::System,
@@ -329,7 +366,7 @@ impl TuiApp {
                         .await;
                 });
 
-                self.status = format!("✅ New session name: '{}'", new_name);
+                self.status = format!("New session name: '{}'", new_name);
             }
             _ => {}
         }

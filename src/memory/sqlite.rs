@@ -111,46 +111,118 @@ impl MemoryDB {
         Ok(())
     }
 
-    /// Buscar facts por similitud semántica (coseno)
-    pub async fn search_facts_semantic(
+    pub async fn get_fact_categories(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT DISTINCT fact_key FROM facts ORDER BY fact_key")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn cache_file(
         &self,
-        query_embedding: &[f32],
-        model_name: &str,
-        limit: u32,
-    ) -> Result<Vec<(String, String, f32)>, sqlx::Error> {
-        // Query devuelve 3 columnas: text_hash (String), embedding (BLOB→Vec<u8>), fact_key (Option<String>)
-        let rows = sqlx::query_as::<_, (String, Vec<u8>, Option<String>)>(
-            // ← FIX: 3 tipos, no 4
-            "SELECT text_hash, embedding, fact_key FROM embedding_cache 
-             WHERE model_name = ? AND fact_key IS NOT NULL",
+        session_id: &str,
+        file_path: &str,
+        content: &str,
+    ) -> Result<(), sqlx::Error> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+
+        let hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        let now = chrono::Utc::now().timestamp();
+
+        sqlx::query(
+            r#"
+        INSERT INTO file_cache (session_id, file_path, content_hash, content, last_accessed)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, file_path) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            content = excluded.content,
+            last_accessed = excluded.last_accessed
+        "#,
         )
-        .bind(model_name)
-        .fetch_all(&self.pool)
+        .bind(session_id)
+        .bind(file_path)
+        .bind(hash)
+        .bind(content)
+        .bind(now)
+        .execute(&self.pool)
         .await?;
 
-        let mut scored: Vec<(String, String, f32)> = Vec::new();
+        Ok(())
+    }
 
-        for (_text_hash, embedding_blob, fact_key_opt) in rows {
-            if let Some(fact_key) = fact_key_opt {
-                // Recuperar el fact_value de la tabla facts
-                if let Ok(Some(value)) = self.get_fact(&fact_key).await {
-                    // Deserializar embedding de BLOB (f32: 4 bytes cada uno)
-                    let stored_emb: Vec<f32> = embedding_blob
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect();
+    /// Intenta obtener un archivo del cache, verificando que no haya cambiado en disco
+    pub async fn get_cached_file(
+        &self,
+        session_id: &str,
+        file_path: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        use sha2::{Digest, Sha256};
+        use std::fs;
+        use std::path::Path;
 
-                    // Calcular similitud coseno
-                    let similarity = cosine_similarity(query_embedding, &stored_emb);
-                    scored.push((fact_key, value, similarity));
-                }
-            }
+        // 1. Buscar en DB
+        let cached: Option<(String, String)> = sqlx::query_as(
+        r#"SELECT content_hash, content FROM file_cache WHERE session_id = ? AND file_path = ?"#,
+    )
+    .bind(session_id)
+    .bind(file_path)
+    .fetch_optional(&self.pool)
+    .await
+    .ok()
+    .flatten();
+
+        let (cached_hash, cached_content) = match cached {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // 2. Verificar que el archivo en disco no haya cambiado
+        let project_root = crate::context::file_loader::get_project_root()?;
+        let absolute_path = project_root.join(file_path);
+
+        if !Path::new(&absolute_path).exists() {
+            return Ok(None);
         }
 
-        // Ordenar por similitud descendente y limitar
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit as usize);
-        Ok(scored)
+        let current_content = fs::read_to_string(&absolute_path)?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(current_content.as_bytes());
+        let current_hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        if current_hash == cached_hash {
+            Ok(Some(cached_content))
+        } else {
+            // Archivo cambió: invalidar cache y retornar None para forzar re-lectura
+            self.invalidate_cached_file(session_id, file_path)
+                .await
+                .ok();
+            Ok(None)
+        }
+    }
+
+    /// Invalida una entrada del cache
+    pub async fn invalidate_cached_file(
+        &self,
+        session_id: &str,
+        file_path: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(r#"DELETE FROM file_cache WHERE session_id = ? AND file_path = ?"#)
+            .bind(session_id)
+            .bind(file_path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
