@@ -1,8 +1,10 @@
 use crate::io::tui::commands::{Command, parse};
 use crate::state::conversation::{ConversationState, MessageRole, UiMessage};
+use ratatui::text::Line;
 use ratatui::widgets::ScrollbarState;
 use ratatui_textarea::TextArea;
 use rig::completion::Chat;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -38,6 +40,7 @@ pub struct TuiApp {
 
     pub vertical_scroll: ScrollbarState,
     pub file_picker: FilePickerState,
+    pub markdown_cache: HashMap<u64, Vec<Line<'static>>>,
 }
 
 impl TuiApp {
@@ -74,6 +77,7 @@ impl TuiApp {
             memory_db,
             vertical_scroll: ScrollbarState::new(0),
             file_picker: FilePickerState::default(),
+            markdown_cache: HashMap::new(),
         }
     }
 

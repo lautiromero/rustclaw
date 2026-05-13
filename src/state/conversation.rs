@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, Hash, PartialEq)]
 pub enum MessageRole {
     #[default]
     User,

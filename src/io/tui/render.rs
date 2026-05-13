@@ -2,7 +2,15 @@ use crate::io::tui::app::TuiApp;
 use crate::state::conversation::MessageRole;
 use ratatui::layout::Margin;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar, ScrollbarOrientation, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, Wrap,
+};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+const MARKDOWN_CACHE_LIMIT: usize = 256;
 
 pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
@@ -20,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     let input_area = chunks[2];
     let status_area = chunks[3];
 
-    let chat_block = Block::new().padding(Padding::new(2, 2, 1, 1));
+    let chat_block = Block::new().padding(Padding::new(2, 3, 1, 1));
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, msg) in app.conversation.messages.iter().enumerate() {
@@ -28,18 +36,15 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
             lines.push(Line::from(""));
         }
 
-        let style = match msg.role {
-            MessageRole::User => Style::default().fg(Color::Cyan),
-            MessageRole::Assistant => Style::default().fg(Color::White),
-            MessageRole::System => Style::default()
-                .fg(Color::Rgb(90, 90, 90))
-                .add_modifier(ratatui::style::Modifier::ITALIC),
-        };
+        lines.extend(render_message_lines(
+            msg.role.clone(),
+            &msg.content,
+            &mut app.markdown_cache,
+        ));
+    }
 
-        for line in msg.content.lines() {
-            // Own each line so the mutable app borrow below stays conflict-free.
-            lines.push(Line::from(Span::styled(line.to_string(), style)));
-        }
+    if app.markdown_cache.len() > MARKDOWN_CACHE_LIMIT {
+        app.markdown_cache.clear();
     }
 
     // From here on, app can be borrowed mutably without conflicting with message rendering.
@@ -73,14 +78,14 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
             .track_style(Style::new().fg(Color::DarkGray))
             .thumb_style(Style::new().fg(Color::Rgb(100, 180, 220)));
 
-        frame.render_stateful_widget(
-            scrollbar,
-            inner_area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
-            &mut app.vertical_scroll,
-        );
+        let scrollbar_area = Rect {
+            x: chat_area.x + chat_area.width.saturating_sub(1),
+            y: inner_area.y.saturating_add(1),
+            width: 1,
+            height: inner_area.height.saturating_sub(2),
+        };
+
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut app.vertical_scroll);
     }
 
     // Help line
@@ -95,7 +100,13 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         Span::styled(" visual mode", Style::new().fg(Color::Rgb(70, 70, 70))),
     ]);
     let help_paragraph = Paragraph::new(help_line);
-    frame.render_widget(help_paragraph, help_area);
+    let help_inner_area = Rect {
+        x: help_area.x.saturating_add(1),
+        y: help_area.y,
+        width: help_area.width.saturating_sub(1),
+        height: help_area.height,
+    };
+    frame.render_widget(help_paragraph, help_inner_area);
 
     // Input
     let input_block = Block::new()
@@ -125,19 +136,25 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         Span::styled("Ctx ", Style::new().fg(Color::Rgb(150, 150, 150))),
         Span::styled(
             context_label,
-            Style::new().fg(Color::Rgb(210, 210, 210)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Rgb(210, 210, 210))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
         Span::styled("Files ", Style::new().fg(Color::Rgb(150, 150, 150))),
         Span::styled(
             format_attachment_count(app.current_attachment_count),
-            Style::new().fg(Color::Rgb(210, 210, 210)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Rgb(210, 210, 210))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
         Span::styled("Time ", Style::new().fg(Color::Rgb(150, 150, 150))),
         Span::styled(
             elapsed_label,
-            Style::new().fg(Color::Rgb(245, 190, 120)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(Color::Rgb(245, 190, 120))
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -150,6 +167,58 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     if app.file_picker.visible {
         render_file_picker(frame, app);
     }
+}
+
+fn render_message_lines(
+    role: MessageRole,
+    content: &str,
+    markdown_cache: &mut HashMap<u64, Vec<Line<'static>>>,
+) -> Vec<Line<'static>> {
+    match role {
+        MessageRole::Assistant => {
+            let key = markdown_cache_key(&role, content);
+            markdown_cache
+                .entry(key)
+                .or_insert_with(|| markdown_to_owned_lines(tui_markdown::from_str(content)))
+                .clone()
+        }
+        MessageRole::User => render_plain_message(content, Style::default().fg(Color::Cyan)),
+        MessageRole::System => render_plain_message(
+            content,
+            Style::default()
+                .fg(Color::Rgb(90, 90, 90))
+                .add_modifier(ratatui::style::Modifier::ITALIC),
+        ),
+    }
+}
+
+fn markdown_cache_key(role: &MessageRole, content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    role.hash(&mut hasher);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn markdown_to_owned_lines(text: Text<'_>) -> Vec<Line<'static>> {
+    text.lines
+        .into_iter()
+        .map(|line| {
+            let owned_spans = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .collect::<Vec<_>>();
+
+            Line::from(owned_spans)
+        })
+        .collect()
+}
+
+fn render_plain_message(content: &str, style: Style) -> Vec<Line<'static>> {
+    content
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), style)))
+        .collect()
 }
 
 fn render_file_picker(frame: &mut Frame, app: &mut TuiApp) {
@@ -173,7 +242,9 @@ fn render_file_picker(frame: &mut Frame, app: &mut TuiApp) {
     let items: Vec<ListItem> = if app.file_picker.matches.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "No files found",
-            Style::new().fg(Color::Rgb(90, 90, 90)).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(Color::Rgb(90, 90, 90))
+                .add_modifier(Modifier::ITALIC),
         )))]
     } else {
         app.file_picker
@@ -223,8 +294,6 @@ fn render_file_picker(frame: &mut Frame, app: &mut TuiApp) {
     ]);
     frame.render_widget(Paragraph::new(hint), hint_area);
 }
-
-
 
 fn format_context_usage(current: Option<usize>) -> String {
     match current {
