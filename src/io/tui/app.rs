@@ -11,12 +11,12 @@ pub enum UiEvent {
     AgentResponse(String),
     AgentError(String),
     NewRigMessage(rig::completion::Message),
+    ToolStatus { name: String, message: String },
 }
 
 pub struct TuiApp {
     pub input: TextArea<'static>,
     pub conversation: ConversationState,
-    pub status: String,
     pub quit: bool,
 
     pub agent: Option<Arc<Mutex<crate::agent::AppAgent>>>,
@@ -29,7 +29,6 @@ pub struct TuiApp {
     pub session_id: String,
     pub memory_db: Arc<crate::memory::sqlite::MemoryDB>,
 
-    // Estado del scrollbar (fuente de verdad para scroll vertical)
     pub vertical_scroll: ScrollbarState,
 }
 
@@ -40,9 +39,9 @@ impl TuiApp {
         initial_rig_history: Vec<rig::completion::Message>,
         session_id: String,
         memory_db: Arc<crate::memory::sqlite::MemoryDB>,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+        ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     ) -> Self {
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-
         Self {
             input: TextArea::default(),
             conversation: ConversationState {
@@ -52,7 +51,6 @@ impl TuiApp {
                 cursor: None,
                 pending_selection: None,
             },
-            status: "Mouse Scroll ON(alt+M)".to_string(),
             quit: false,
             agent: Some(Arc::new(Mutex::new(agent))),
             ui_tx,
@@ -66,17 +64,14 @@ impl TuiApp {
         }
     }
 
-    // ← NUEVO: Sincroniza el scrollbar con el contenido real y el viewport
     pub fn sync_scrollbar(&mut self, content_height: usize, viewport_height: usize) {
         let max_pos = content_height.saturating_sub(viewport_height);
 
         if self.conversation.auto_scroll {
-            // Auto-scroll: fuerza al fondo
             self.vertical_scroll = ScrollbarState::new(content_height)
                 .position(max_pos)
                 .viewport_content_length(viewport_height);
         } else {
-            // Scroll manual: mantiene posición actual, clampa al límite
             let current = self.vertical_scroll.get_position().min(max_pos);
             self.vertical_scroll = ScrollbarState::new(content_height)
                 .position(current)
@@ -100,37 +95,25 @@ impl TuiApp {
             return;
         }
 
-        let trimmed = raw_input.trim().to_string();
-        if trimmed.is_empty() {
+        let msg = raw_input.trim().to_string();
+        if msg.is_empty() {
             return;
         }
 
-        let clean_message = trimmed
-            .split("--- USER CONTEXT ---")
-            .next()
-            .unwrap_or(&trimmed)
-            .split("--- END CONTEXT ---")
-            .next()
-            .unwrap_or(&trimmed)
-            .trim()
-            .to_string();
-
+        // 1. Push user message
         self.conversation.messages.push(UiMessage {
             role: MessageRole::User,
-            content: clean_message.clone(),
-            raw: Some(clean_message.clone()),
+            content: msg.clone(),
+            raw: Some(msg.clone()),
             timestamp: chrono::Utc::now(),
         });
-
         self.conversation.auto_scroll = true;
         self.conversation.scroll_offset = 0;
 
-        let file_refs = crate::context::file_loader::extract_file_references(&clean_message);
-        let mut enriched_prompt = clean_message.clone();
-        let mut files_loaded = 0;
-
+        // 2. Handle @file references
+        let file_refs = crate::context::file_loader::extract_file_references(&msg);
+        let mut enriched_prompt = msg.clone();
         for file_path in &file_refs {
-            // Puente sync→async (ya lo usabas, se mantiene igual)
             let cached = {
                 let db = self.memory_db.clone();
                 let session = self.session_id.clone();
@@ -144,10 +127,7 @@ impl TuiApp {
             };
 
             let content = match cached {
-                Some(c) => {
-                    crate::utils::debug_log(&format!("🗃️ UI cache HIT: {}", file_path));
-                    c
-                }
+                Some(c) => c,
                 None => match crate::context::file_loader::read_file_text(file_path) {
                     Ok(c) => {
                         let db = self.memory_db.clone();
@@ -157,53 +137,70 @@ impl TuiApp {
                         tokio::spawn(async move {
                             crate::context::file_cache::store_in_cache(&db, &s, &p, &c_clone).await;
                         });
-                        crate::utils::debug_log(&format!("💾 UI cache STORED: {}", file_path));
                         c
                     }
                     Err(_) => continue,
                 },
             };
-
             enriched_prompt.push_str(&format!("\n\n[FILE: {}]\n{}\n[/FILE]", file_path, content));
-            files_loaded += 1;
         }
 
-        crate::utils::debug_log(&format!(
-            "📤 Files injected: {:?}, Prompt: {} chars",
-            file_refs,
-            enriched_prompt.len()
-        ));
-
+        // 3. Set pending + show "Thinking..."
+        self.pending_response = true;
         self.conversation.messages.push(UiMessage {
             role: MessageRole::System,
-            content: if files_loaded > 0 {
-                "Reading files...".to_string()
-            } else {
-                "Thinking...".to_string()
-            },
+            content: "Thinking...".to_string(),
             raw: None,
             timestamp: chrono::Utc::now(),
         });
+        self.conversation.auto_scroll = true;
 
-        self.pending_response = true;
-
+        // 4. Clone deps
         let agent = self.agent.clone().unwrap();
         let ui_tx = self.ui_tx.clone();
-        let chat_history = self.chat_history.clone();
         let session_id = self.session_id.clone();
         let memory_db = self.memory_db.clone();
-        let user_text_for_db = clean_message.clone();
-
+        let user_text_for_db = msg.clone();
         let config = crate::config::Config::load().expect("Failed to load config");
-        let timeout_secs = config.timeout_base_secs * config.max_turns;
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+        let timeout_duration =
+            std::time::Duration::from_secs(config.timeout_base_secs * config.max_turns);
 
+        let max_ctx = config.max_context_messages;
+        let chat_history: Vec<rig::completion::Message> = if self.chat_history.len() > max_ctx {
+            self.chat_history[self.chat_history.len().saturating_sub(max_ctx)..].to_vec()
+        } else {
+            self.chat_history.clone()
+        };
+
+        // 5. Spawn async task WITH IN-CHAT DEBUG
         tokio::spawn(async move {
+            let _ = ui_tx.send(UiEvent::ToolStatus {
+                name: "agent".into(),
+                message: "Locking agent...".into(),
+            });
+
+            let agent_locked = agent.lock().await;
+
+            let _ = ui_tx.send(UiEvent::ToolStatus {
+                name: "agent".into(),
+                message: "Processing...".into(),
+            });
+
             let result = tokio::time::timeout(
                 timeout_duration,
-                agent.lock().await.chat(&enriched_prompt, chat_history),
+                agent_locked.chat(&enriched_prompt, chat_history),
             )
             .await;
+
+            let status_msg = match &result {
+                Ok(Ok(resp)) => format!("LLM responded ({} chars)", resp.len()),
+                Ok(Err(e)) => format!("LLM error: {}", e),
+                Err(_) => format!("Timeout after {}s", timeout_duration.as_secs()),
+            };
+            let _ = ui_tx.send(UiEvent::ToolStatus {
+                name: "agent".into(),
+                message: status_msg,
+            });
 
             match result {
                 Ok(Ok(resp)) => {
@@ -237,7 +234,7 @@ impl TuiApp {
                 Err(_) => {
                     let _ = ui_tx.send(UiEvent::AgentError(format!(
                         "Request timed out ({}s)",
-                        timeout_secs
+                        timeout_duration.as_secs()
                     )));
                 }
             }
@@ -248,8 +245,9 @@ impl TuiApp {
         while let Ok(event) = self.ui_rx.try_recv() {
             match event {
                 UiEvent::AgentResponse(text) => {
+                    // Remove pending "Thinking..." if present
                     if let Some(last) = self.conversation.messages.last() {
-                        if last.role == MessageRole::System {
+                        if last.role == MessageRole::System && last.content == "Thinking..." {
                             self.conversation.messages.pop();
                         }
                     }
@@ -260,7 +258,6 @@ impl TuiApp {
                         raw: Some(text.clone()),
                         timestamp: chrono::Utc::now(),
                     });
-
                     self.conversation.auto_scroll = true;
                     self.conversation.scroll_offset = 0;
 
@@ -280,12 +277,11 @@ impl TuiApp {
                             let _ = mem.save_message(&sid, &db_msg).await;
                         });
                     }
-
                     self.pending_response = false;
                 }
                 UiEvent::AgentError(err) => {
                     if let Some(last) = self.conversation.messages.last() {
-                        if last.role == MessageRole::System {
+                        if last.role == MessageRole::System && last.content == "Thinking..." {
                             self.conversation.messages.pop();
                         }
                     }
@@ -300,6 +296,21 @@ impl TuiApp {
                 UiEvent::NewRigMessage(rig_msg) => {
                     self.chat_history.push(rig_msg);
                 }
+                UiEvent::ToolStatus { name, message } => {
+                    // Tool logs overwrite "Thinking..." if it's on screen
+                    if let Some(last) = self.conversation.messages.last() {
+                        if last.role == MessageRole::System && last.content == "Thinking..." {
+                            self.conversation.messages.pop();
+                        }
+                    }
+                    self.conversation.messages.push(UiMessage {
+                        role: MessageRole::System,
+                        content: format!("[{}] {}", name, message),
+                        raw: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                    self.conversation.auto_scroll = true;
+                }
             }
         }
     }
@@ -311,7 +322,13 @@ impl TuiApp {
             }
             Command::Exit => self.quit = true,
             Command::Help => {
-                self.status = "Enter=enviar | Shift/Alt+Enter=newline | Ctrl+C=salir".to_string()
+                self.conversation.messages.push(UiMessage {
+                    role: MessageRole::System,
+                    content: "Enter=send | Shift/Alt+Enter=newline | Ctrl+C=exit".to_string(),
+                    raw: None,
+                    timestamp: chrono::Utc::now(),
+                });
+                self.conversation.auto_scroll = true;
             }
             Command::Copy { target } => {
                 let last_assistant_msg = self
@@ -322,51 +339,73 @@ impl TuiApp {
                     .find(|m| m.role == MessageRole::Assistant);
 
                 if let Some(msg) = last_assistant_msg {
-                    let code_block = crate::utils::clipboard::get_code_block(&msg.content, &target);
-
-                    match code_block {
-                        Some(block) => match crate::utils::clipboard::copy_to_clipboard(&block) {
+                    if let Some(block) =
+                        crate::utils::clipboard::get_code_block(&msg.content, &target)
+                    {
+                        match crate::utils::clipboard::copy_to_clipboard(&block) {
                             Ok(_) => {
-                                let block_num = if target == "last" { "último" } else { &target };
-                                self.status = format!("Block {} copied to clipboard", block_num);
+                                self.conversation.messages.push(UiMessage {
+                                    role: MessageRole::System,
+                                    content: format!(
+                                        "Block {} copied to clipboard",
+                                        if target == "last" { "last" } else { &target }
+                                    ),
+                                    raw: None,
+                                    timestamp: chrono::Utc::now(),
+                                });
                             }
-                            Err(e) => self.status = format!("❌ Copy failed: {}", e),
-                        },
-                        None => {
-                            let blocks_count =
-                                crate::utils::clipboard::extract_code_blocks(&msg.content).len();
-                            self.status = if blocks_count == 0 {
-                                "⚠️ No code blocks found in last message".to_string()
-                            } else {
-                                format!("Invalid index. Available: 1-{}", blocks_count)
-                            };
+                            Err(e) => {
+                                self.conversation.messages.push(UiMessage {
+                                    role: MessageRole::System,
+                                    content: format!("Copy failed: {}", e),
+                                    raw: None,
+                                    timestamp: chrono::Utc::now(),
+                                });
+                            }
                         }
+                    } else {
+                        let count =
+                            crate::utils::clipboard::extract_code_blocks(&msg.content).len();
+                        self.conversation.messages.push(UiMessage {
+                            role: MessageRole::System,
+                            content: if count == 0 {
+                                "No code blocks found".to_string()
+                            } else {
+                                format!("Invalid index. Available: 1-{}", count)
+                            },
+                            raw: None,
+                            timestamp: chrono::Utc::now(),
+                        });
                     }
                 } else {
-                    self.status = "No assistant message to copy from".to_string();
+                    self.conversation.messages.push(UiMessage {
+                        role: MessageRole::System,
+                        content: "No assistant message to copy from".to_string(),
+                        raw: None,
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
+                self.conversation.auto_scroll = true;
             }
-
             Command::RenameSession(name) => {
                 if name.trim().is_empty() {
-                    self.status = "❌ Rename: nombre vacío".to_string();
                     return;
                 }
-
                 let new_name = name.trim().to_string();
-                let new_name_for_db = new_name.clone();
-
-                let memory_db = self.memory_db.clone();
-                let session_id = self.session_id.clone();
-
+                let mem = self.memory_db.clone();
+                let sid = self.session_id.clone();
+                let n = new_name.clone();
                 tokio::spawn(async move {
                     use crate::memory::session_store::SessionStore;
-                    let _ = memory_db
-                        .update_session_name(&session_id, &new_name_for_db)
-                        .await;
+                    let _ = mem.update_session_name(&sid, &n).await;
                 });
-
-                self.status = format!("New session name: '{}'", new_name);
+                self.conversation.messages.push(UiMessage {
+                    role: MessageRole::System,
+                    content: format!("Session renamed: '{}'", new_name),
+                    raw: None,
+                    timestamp: chrono::Utc::now(),
+                });
+                self.conversation.auto_scroll = true;
             }
             _ => {}
         }

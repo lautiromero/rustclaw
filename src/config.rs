@@ -12,6 +12,9 @@ pub struct Config {
     // Control de timeout dinámico
     pub max_turns: u64, // Máx. iteraciones internas por mensaje del usuario
     pub timeout_base_secs: u64, // Timeout base por iteración (en segundos)
+
+    // Control de contexto enviado al agente
+    pub max_context_messages: usize, // Últimos N mensajes a enviar al agente (excluyendo system prompt)
 }
 
 impl Config {
@@ -43,6 +46,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(40), // Default por iteración
+
+            max_context_messages: std::env::var("MAX_CONTEXT_MESSAGES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20), // Default: últimos 20 mensajes
         })
     }
 }

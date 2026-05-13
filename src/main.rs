@@ -78,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
 
     let embed_model = embed_client.embedding_model(&config.embedding_model);
 
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // Construir agente (ahora es async)
     let agent = build_agent(
         &config,
@@ -85,10 +87,17 @@ async fn main() -> anyhow::Result<()> {
         memory_db_arc.clone(),
         embed_model,
         session_id.clone(),
+        Some(ui_tx.clone()),
     )
     .await?;
 
-    crate::io::tui::run_tui(agent, memory_db_arc.clone(), session_id.clone())?;
+    crate::io::tui::run_tui(
+        agent,
+        memory_db_arc.clone(),
+        session_id.clone(),
+        ui_tx.clone(),
+        ui_rx,
+    )?;
 
     Ok(())
 }

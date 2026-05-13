@@ -17,6 +17,7 @@ pub async fn build_agent<M>(
     memory_db: Arc<MemoryDB>,
     embed_model: M,
     session_id: String,
+    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
 ) -> Result<AppAgent>
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
@@ -80,6 +81,9 @@ RESPONSE FORMAT:
     let save_tool = SaveFactTool::new(memory_db.clone());
     let file_reader_tool = ReadFileTool::new(memory_db.clone(), session_id.clone());
     let recall_tool = RecallTool::new(memory_db.clone());
+    let read_dir_tool = crate::tools::read_dir::ReadDirTool::new(ui_tx);
+    let apply_diff_tool = crate::tools::ApplyDiffTool;
+    let write_file_tool = crate::tools::WriteFileTool;
 
     let agent = rig::agent::AgentBuilder::new(llm_model)
         .preamble(&preamble)
@@ -91,7 +95,10 @@ RESPONSE FORMAT:
         .tool(save_tool)
         .tool(recall_tool)
         .tool(file_reader_tool)
-        .default_max_turns(5)
+        .tool(read_dir_tool)
+        .tool(apply_diff_tool)
+        .tool(write_file_tool)
+        .default_max_turns(config.max_turns as usize)
         .build();
 
     tracing::info!(

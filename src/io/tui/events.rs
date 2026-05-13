@@ -1,4 +1,4 @@
-use crate::io::tui::app::TuiApp;
+use crate::io::tui::app::{TuiApp, UiEvent};
 use crate::io::tui::commands::Command;
 use crate::io::tui::render::render;
 use crate::memory::session_store::SessionStore;
@@ -18,11 +18,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui_textarea::Input;
 use std::io;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub fn run_tui(
     agent: crate::agent::AppAgent,
     memory_db: Arc<crate::memory::sqlite::MemoryDB>,
     session_id: String,
+    ui_tx: mpsc::UnboundedSender<crate::io::tui::app::UiEvent>,
+    mut ui_rx: mpsc::UnboundedReceiver<crate::io::tui::app::UiEvent>,
 ) -> Result<()> {
     let mut stdout = io::stdout();
 
@@ -43,16 +46,18 @@ pub fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let (initial_ui, initial_rig) = load_session_messages(&memory_db, &session_id);
+
     let mut app = TuiApp::new(
         agent,
         initial_ui,
         initial_rig,
         session_id.clone(),
         memory_db.clone(),
+        ui_tx.clone(),
+        ui_rx,
     );
 
     loop {
-        // ← IMPORTANTE: render ahora toma &mut app
         terminal.draw(|f| render(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -69,7 +74,6 @@ pub fn run_tui(
                     match mouse_event.kind {
                         MouseEventKind::ScrollUp => {
                             app.conversation.auto_scroll = false;
-                            // ← FIX: Usar métodos de ScrollbarState (mismo ritmo que antes)
                             app.vertical_scroll.prev();
                             app.vertical_scroll.prev();
                             app.vertical_scroll.prev();
@@ -145,20 +149,6 @@ pub fn run_tui(
                     if let Some(cmd) = app.handle_submit() {
                         match cmd {
                             Command::Message(msg) => {
-                                // let enriched = if let Some(ref injector) = context_injector {
-                                //     let ctx = tokio::task::block_in_place(|| {
-                                //         tokio::runtime::Handle::current()
-                                //             .block_on(injector.build_context(&msg, 3))
-                                //     });
-                                //     if !ctx.trim().is_empty() {
-                                //         format!("{}\n\n{}", msg, ctx)
-                                //     } else {
-                                //         msg
-                                //     }
-                                // } else {
-                                //     msg
-                                // };
-                                // app.send_to_agent(enriched);
                                 app.send_to_agent(msg);
                             }
                             cmd => app.execute(cmd),
@@ -171,15 +161,13 @@ pub fn run_tui(
                     }
                 }
             }
-
-            app.poll_agent_events();
-
-            if app.quit {
-                break;
-            }
         }
 
         app.poll_agent_events();
+
+        if app.quit {
+            break;
+        }
     }
 
     terminal::disable_raw_mode()?;
