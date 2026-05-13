@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::debug_log;
 
-/// Resuelve el directorio base para paths relativos: el cwd donde se ejecutó el agente
+/// Resolves the base directory for relative paths: the cwd where the agent was launched.
 pub fn get_project_root() -> Result<PathBuf> {
     std::env::current_dir().context("Failed to get current working directory")
 }
 
-/// Lee un archivo y retorna su contenido como String
-/// - Resuelve paths relativos contra el project root
-/// - Rechaza archivos binarios o muy grandes (>1MB por ahora)
+/// Reads a file and returns its content as a String.
+/// - Resolves relative paths against the project root.
+/// - Rejects binary or very large files (>1MB for now).
 pub fn read_file_text(relative_path: &str) -> Result<String> {
     let project_root = get_project_root()?;
     let absolute_path = project_root.join(relative_path);
@@ -29,17 +29,17 @@ pub fn read_file_text(relative_path: &str) -> Result<String> {
         absolute_path.display()
     ));
 
-    // Validaciones de seguridad
+    // Security checks.
     validate_file_path(&absolute_path)?;
 
-    // Leer contenido
+    // Read content.
     fs::read_to_string(&absolute_path)
         .with_context(|| format!("Failed to read file: {}", absolute_path.display()))
 }
 
-/// Valida que un archivo sea seguro para leer (texto, tamaño razonable, no binario)
+/// Validates that a file is safe to read: text, reasonable size, and non-binary.
 fn validate_file_path(path: &Path) -> Result<()> {
-    // Verificar que existe y es archivo
+    // Ensure the path exists and is a file.
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
     }
@@ -49,13 +49,13 @@ fn validate_file_path(path: &Path) -> Result<()> {
         anyhow::bail!("Not a file: {}", path.display());
     }
 
-    // Límite de tamaño: 1MB por ahora (configurable después)
+    // Size limit: 1MB for now, configurable later.
     const MAX_SIZE: u64 = 1024 * 1024; // 1MB
     if metadata.len() > MAX_SIZE {
         anyhow::bail!("File too large (>1MB): {}", path.display());
     }
 
-    // Intentar detectar binarios por extensión común
+    // Detect common binary extensions.
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let binary_exts = [
             "exe", "dll", "so", "dylib", "bin", "o", "a", "lib", "pdf", "zip", "tar", "gz",
@@ -68,18 +68,17 @@ fn validate_file_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Descubre archivos que matcheen un prefix para autocomplete
-/// - Busca recursivamente desde project_root
-/// - Excluye directorios ruidosos: node_modules, target, .git, etc.
-/// - Retorna paths relativos al project root
+/// Discovers files that match a fuzzy query for autocomplete.
+/// - Searches recursively from project_root.
+/// - Excludes noisy directories: node_modules, target, .git, etc.
+/// - Returns paths relative to project_root.
 pub fn discover_files(prefix: &str) -> Result<Vec<String>> {
     let project_root = get_project_root()?;
     let mut matches = Vec::new();
 
-    // Normalizar prefix: quitar @ inicial si existe
-    let search_prefix = prefix.strip_prefix('@').unwrap_or(prefix);
+    let search_query = prefix.strip_prefix('@').unwrap_or(prefix).to_lowercase();
 
-    // Exclusiones hardcodeadas (después se puede hacer configurable)
+    // Hardcoded exclusions; can become configurable later.
     let excluded_dirs = [
         "node_modules",
         "target",
@@ -90,73 +89,85 @@ pub fn discover_files(prefix: &str) -> Result<Vec<String>> {
         ".idea",
     ];
 
-    // Recorrer árbol de directorios
+    // Walk the project tree.
     for entry in walkdir::WalkDir::new(&project_root)
         .into_iter()
         .filter_entry(|e| {
-            // Excluir directorios ruidosos
+            // Exclude noisy directories.
             let name = e.file_name().to_string_lossy();
             !excluded_dirs.contains(&name.as_ref()) && !name.starts_with('.')
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
     {
-        // Calcular path relativo al project root
+        // Compute path relative to project_root.
         if let Ok(rel_path) = entry.path().strip_prefix(&project_root) {
-            let rel_str = rel_path.to_string_lossy().replace('\\', "/"); // Normalizar separadores
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
-            // Si matchea el prefix, agregarlo
-            if rel_str.starts_with(search_prefix) {
+            if fuzzy_score(&rel_str.to_lowercase(), &search_query).is_some() {
                 matches.push(rel_str);
             }
         }
     }
 
-    // Limitar resultados para no saturar la UI (configurable)
+    matches.sort_by_key(|path| fuzzy_score(&path.to_lowercase(), &search_query).unwrap_or(usize::MAX));
     matches.truncate(50);
-    matches.sort();
 
     Ok(matches)
 }
 
-/// Parsea un input que puede contener @-references y extrae los paths
-/// Ej: "revisá @src/main.rs y @Cargo.toml" → ["src/main.rs", "Cargo.toml"]
+fn fuzzy_score(candidate: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(candidate.len());
+    }
+
+    let mut score = 0;
+    let mut last_match = 0;
+    let mut chars = candidate.char_indices();
+
+    for query_char in query.chars() {
+        let Some((idx, _)) = chars.find(|(_, candidate_char)| *candidate_char == query_char) else {
+            return None;
+        };
+        score += idx.saturating_sub(last_match);
+        last_match = idx;
+    }
+
+    Some(score + candidate.len().saturating_sub(last_match))
+}
+
+/// Parses input containing @-references and extracts paths.
+/// Example: "review @src/main.rs and @Cargo.toml" -> ["src/main.rs", "Cargo.toml"]
 pub fn extract_file_references(input: &str) -> Vec<String> {
     let mut refs = Vec::new();
-
-    // Buscar patrones @path/to/file (soporta espacios si están entre comillas)
-    let mut in_quotes = false;
     let mut current_ref = String::new();
+    let mut in_ref = false;
 
     for ch in input.chars() {
         match ch {
-            '@' if !in_quotes => {
-                if !current_ref.is_empty() {
-                    refs.push(current_ref.clone());
-                    current_ref.clear();
-                }
-            }
-            '"' => {
-                in_quotes = !in_quotes;
-                if !in_quotes && !current_ref.is_empty() {
-                    refs.push(current_ref.clone());
-                    current_ref.clear();
-                }
-            }
-            ' ' if !in_quotes => {
-                if current_ref.starts_with('@') && current_ref.len() > 1 {
-                    refs.push(current_ref[1..].to_string());
-                }
+            '@' => {
+                push_file_ref(&mut refs, &current_ref);
                 current_ref.clear();
+                in_ref = true;
             }
-            _ => current_ref.push(ch),
+            ch if in_ref && ch.is_whitespace() => {
+                push_file_ref(&mut refs, &current_ref);
+                current_ref.clear();
+                in_ref = false;
+            }
+            ch if in_ref => current_ref.push(ch),
+            _ => {}
         }
     }
 
-    // Capturar último reference si existe
-    if current_ref.starts_with('@') && current_ref.len() > 1 {
-        refs.push(current_ref[1..].to_string());
-    }
+    push_file_ref(&mut refs, &current_ref);
+    refs
+}
 
-    refs.into_iter().filter(|p| !p.is_empty()).collect()
+fn push_file_ref(refs: &mut Vec<String>, current_ref: &str) {
+    let path = current_ref.trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';' | ')' | ']'));
+
+    if !path.is_empty() {
+        refs.push(path.to_string());
+    }
 }

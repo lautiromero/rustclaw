@@ -40,12 +40,12 @@ impl Config {
             max_turns: std::env::var("AGENT_MAX_TURNS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5), // Default iteraciones máx. por mensaje
+                .unwrap_or(25), // Default iteraciones máx. por mensaje
 
             timeout_base_secs: std::env::var("AGENT_TIMEOUT_BASE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(40), // Default por iteración
+                .unwrap_or(30), // Default por iteración
 
             max_context_messages: std::env::var("MAX_CONTEXT_MESSAGES")
                 .ok()

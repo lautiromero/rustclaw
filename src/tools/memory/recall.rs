@@ -52,9 +52,12 @@ impl Tool for RecallTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        tracing::info!("🔍 Loading topic: '{}'", args.query);
+        if args.query.eq_ignore_ascii_case("general") || args.query.starts_with("general_") {
+            return Ok(
+                "General rules are pre-loaded in the system prompt. No recall needed.".to_string(),
+            );
+        }
 
-        // ← FIX: self.db.pool() ya devuelve &Pool, no agregues & extra
         let results = sqlx::query_as::<_, (String, String)>(
             "SELECT fact_key, fact_value FROM facts 
              WHERE fact_key LIKE ? || '_%' 

@@ -7,8 +7,8 @@ src/
 ├── main.rs                    → Entry point: carga config, init DB, embeddings, build_agent, run_tui
 ├── config.rs                  → Config struct (desde .env): API keys, modelos, max_context_messages (default 20), timeouts
 ├── agent/
-│   ├── mod.rs                 → type alias AppAgent = rig::agent::Agent<NvidiaModel>
-│   ├── builder.rs             → build_agent(): crea el agente con preamble, tools, dynamic context, temperature 0.2
+│   ├── mod.rs                 → type alias AppAgent = rig::agent::Agent<OpenAI CompletionModel<reqwest::Client>>
+│   ├── builder.rs             → build_agent(): crea cliente OpenAI-compatible, preamble, tools, dynamic context, temperature 0.2
 │   ├── hooks.rs               → AgentHooks: eventos (PromptSent, StreamingChunk, ToolCalled, etc.) + cancel_flag
 │   └── service.rs             → AgentService: wrapper simple agent.prompt().send()
 ├── context/
@@ -42,10 +42,11 @@ src/
 │   ├── mod.rs
 │   └── conversation.rs        → ConversationState, MessageRole (User/Assistant/System), UiMessage
 ├── tools/
-│   ├── mod.rs                 → Re-exporta ApplyDiffTool, ReadDirTool, ReadFileTool
+│   ├── mod.rs                 → Re-exporta ApplyDiffTool, ReadDirTool, ReadFileTool, WriteFileTool
 │   ├── apply_diff.rs          → Tool: SEARCH/REPLACE diff con backup .bak, múltiples bloques, preview
-│   ├── read_dir.rs            → Tool: lista archivos/dirs respetando .gitignore, exclude dirs ruidosos, max_depth
+│   ├── read_dir.rs            → Tool: lista archivos/dirs respetando .gitignore, exclude dirs ruidosos, max_depth, status TUI
 │   ├── read_file.rs           → Tool: lee archivos con cache SQLite persistente
+│   ├── write_file.rs          → Tool: crea archivos o sobrescribe con confirm_overwrite=true y backup .bak
 │   ├── memory/
 │   │   ├── mod.rs
 │   │   ├── recall.rs          → Tool: recall_memory(query) → carga facts de DB por topic (LIKE 'topic_%')
@@ -71,12 +72,13 @@ src/
    - Para cada referencia: intenta cache (SQLite) → si miss, lee disco y guarda en cache. Inyecta `[FILE: path]\ncontent\n[/FILE]` al prompt.
    - Agrega mensaje `System` "Thinking..." a la UI.
    - **Trunca el historial**: toma `config.max_context_messages` (default 20) últimos mensajes de `self.chat_history` y se los pasa al agente. El historial completo se conserva en UI.
-   - Spawnea una tarea async que llama a `agent.lock().await.chat(enriched_prompt, truncated_history)` con timeout dinámico (`timeout_base_secs * max_turns`).
-   - Al recibir respuesta: envía `UiEvent::AgentResponse` y `UiEvent::NewRigMessage` por el canal.
+   - Spawnea una tarea async que bloquea el agente, emite `ToolStatus` (`agent`) y llama a `agent.chat(enriched_prompt, truncated_history)` con timeout dinámico (`timeout_base_secs * max_turns`).
+   - Al recibir respuesta: guarda el mensaje del usuario en DB y envía `UiEvent::AgentResponse` + `UiEvent::NewRigMessage` por el canal.
 4. **`poll_agent_events()`** → drena el canal `ui_rx`:
    - `AgentResponse`: reemplaza "Thinking..." por la respuesta, agrega a UI, guarda en DB.
    - `AgentError`: muestra error en UI.
    - `NewRigMessage`: agrega al `chat_history` en memoria.
+   - `ToolStatus`: reemplaza "Thinking..." si corresponde y agrega un mensaje de sistema `[tool] status`.
 5. **`execute(cmd)`** → maneja comandos: `/copy`, `/rename`, `/help`, `exit`.
 
 ## Config relevante (config.rs)
@@ -84,17 +86,18 @@ src/
 | Variable | Default | Descripción |
 |---|---|---|
 | `max_context_messages` | 20 | Últimos N mensajes enviados al agente (excluye system prompt) |
-| `max_turns` | 30 | Iteraciones internas máximas por mensaje del usuario |
+| `max_turns` | 5 | Iteraciones internas máximas por mensaje del usuario |
 | `timeout_base_secs` | 40 | Timeout base por iteración (timeout total = base * max_turns) |
 | `max_context` | 3 | Documentos del dynamic context (RAG) |
 
 ## Tools del agente (builder.rs)
 
+- `katana_crawl` → crawlea URLs (stub, llama a katana externo)
 - `save_fact` → guarda reglas/preferencias en DB
 - `recall_memory` → carga facts por topic (ej: "coding", "linux")
-- `read_file` → lee archivos con cache
-- `read_dir` → lista estructura de directorios
+- `read_file` → lee archivos con cache SQLite
+- `read_dir` → lista estructura de directorios y reporta estado al TUI
 - `apply_diff` → aplica SEARCH/REPLACE diffs con backup .bak
-- `katana_crawl` → crawlea URLs (stub)
+- `write_file` → crea archivos nuevos o sobrescribe con confirmación y backup .bak
 
-El preamble del agente incluye reglas globales desde DB (`general_*`), protocolo de memoria, defaults (idioma del usuario, código en inglés, sin emojis en código).
+El preamble del agente incluye facts globales desde DB (`general_*`) y reglas breves: recall solo para temas específicos, responder en el idioma del usuario y evitar meta-comentarios/proceso. El LLM se instancia con `rig::providers::openai::CompletionsClient` apuntando a `NVIDIA_BASE_URL`; el cliente NVIDIA propio queda comentado.

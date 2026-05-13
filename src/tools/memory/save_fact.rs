@@ -30,18 +30,28 @@ impl Tool for SaveFactTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.into(),
-            description: "Saves a user rule or preference to persistent memory. Use logical keys (e.g., 'coding_style', 'language_prefs', 'betting_rules')".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string", "description": "Category or topic key (e.g., 'coding_style', 'user_language')" },
-                    "value": { "type": "string", "description": "The rule or preference to persist" },
-                    "context": { "type": "string", "description": "Optional context or source", "default": null }
+        name: Self::NAME.into(),
+        description: "Saves a fact, rule, or preference to persistent memory. KEY NAMING IS CRITICAL: Use 'general_<name>' for user-specific rules that apply to EVERY session (e.g., 'general_name', 'general_language', 'general_coding_style'). Use '<topic>_<detail>' for domain-specific rules (e.g., 'coding_style', 'linux_shell_prefs'). The system automatically loads all 'general_*' facts into the preamble of every new session.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "key": { 
+                    "type": "string", 
+                    "description": "MUST follow convention: 'general_*' for global/user-wide preferences, or '<topic>_<detail>' for domain-specific rules. Examples: 'general_name', 'general_language', 'coding_style', 'betting_odds_format'." 
                 },
-                "required": ["key", "value"]
-            }),
-        }
+                "value": { 
+                    "type": "string", 
+                    "description": "The exact rule, preference, or fact to persist." 
+                },
+                "context": { 
+                    "type": "string", 
+                    "description": "Optional source or context (e.g., 'user_stated', 'inferred', 'project_specific')", 
+                    "default": null 
+                }
+            },
+            "required": ["key", "value"]
+        }),
+    }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {

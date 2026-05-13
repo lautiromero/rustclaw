@@ -2,21 +2,23 @@ use crate::io::tui::app::TuiApp;
 use crate::state::conversation::MessageRole;
 use ratatui::layout::Margin;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar, ScrollbarOrientation, Wrap};
 
 pub fn render(frame: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Fill(1),
+            Constraint::Length(1),
             Constraint::Length(4),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
     let chat_area = chunks[0];
-    let input_area = chunks[1];
-    let status_area = chunks[2];
+    let help_area = chunks[1];
+    let input_area = chunks[2];
+    let status_area = chunks[3];
 
     let chat_block = Block::new().padding(Padding::new(2, 2, 1, 1));
 
@@ -35,12 +37,12 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         };
 
         for line in msg.content.lines() {
-            // ← .to_string() rompe el préstamo con app
+            // Own each line so the mutable app borrow below stays conflict-free.
             lines.push(Line::from(Span::styled(line.to_string(), style)));
         }
     }
 
-    // Ahora podemos tomar app prestada mutablemente sin conflictos
+    // From here on, app can be borrowed mutably without conflicting with message rendering.
     let inner_area = chat_block.inner(chat_area);
     let viewport_height = inner_area.height as usize;
     let bounding_width = inner_area.width as usize;
@@ -49,19 +51,19 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         .block(chat_block)
         .wrap(Wrap { trim: true });
 
-    // Calcular líneas reales (requiere feature unstable-rendered-line-info)
+    // Compute rendered line count. Requires the unstable-rendered-line-info feature.
     let content_height = paragraph.line_count(bounding_width as u16);
 
-    // Sincronizar estado del scrollbar (préstamo mutable)
+    // Keep scrollbar state in sync with the rendered content height.
     app.sync_scrollbar(content_height, viewport_height);
 
-    // Aplicar scroll usando la posición actualizada
+    // Apply scroll using the synchronized position.
     let scroll_row = app.vertical_scroll.get_position() as u16;
     let scrolled_paragraph = paragraph.scroll((scroll_row, 0));
 
     frame.render_widget(scrolled_paragraph, chat_area);
 
-    // Renderizar widget Scrollbar solo si hay overflow
+    // Render the scrollbar only when content overflows.
     if content_height > viewport_height {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -81,6 +83,20 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         );
     }
 
+    // Help line
+    let help_line = Line::from(vec![
+        Span::styled("Click/Esc", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" toggle selection", Style::new().fg(Color::Rgb(70, 70, 70))),
+        Span::styled("  |  ", Style::new().fg(Color::Rgb(55, 55, 55))),
+        Span::styled("@", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" files", Style::new().fg(Color::Rgb(70, 70, 70))),
+        Span::styled("  |  ", Style::new().fg(Color::Rgb(55, 55, 55))),
+        Span::styled("Ctrl+E", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" visual mode", Style::new().fg(Color::Rgb(70, 70, 70))),
+    ]);
+    let help_paragraph = Paragraph::new(help_line);
+    frame.render_widget(help_paragraph, help_area);
+
     // Input
     let input_block = Block::new()
         .title(" > ")
@@ -96,6 +112,9 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         "Select Mode"
     };
 
+    let context_label = format_context_usage(app.current_context_tokens);
+    let elapsed_label = format_elapsed(app.response_elapsed_secs());
+
     let line = Line::from(vec![
         Span::styled("Active: ", Style::new().fg(Color::Rgb(150, 150, 150))),
         Span::styled(
@@ -103,11 +122,22 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
             Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
-        Span::styled("Click/Esc ", Style::new().fg(Color::Rgb(100, 180, 220))),
-        Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
+        Span::styled("Ctx ", Style::new().fg(Color::Rgb(150, 150, 150))),
         Span::styled(
-            "Ctrl+E > Visual",
-            Style::new().fg(Color::Rgb(120, 200, 150)),
+            context_label,
+            Style::new().fg(Color::Rgb(210, 210, 210)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
+        Span::styled("Files ", Style::new().fg(Color::Rgb(150, 150, 150))),
+        Span::styled(
+            format_attachment_count(app.current_attachment_count),
+            Style::new().fg(Color::Rgb(210, 210, 210)).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::new().fg(Color::Rgb(80, 80, 80))),
+        Span::styled("Time ", Style::new().fg(Color::Rgb(150, 150, 150))),
+        Span::styled(
+            elapsed_label,
+            Style::new().fg(Color::Rgb(245, 190, 120)).add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -116,4 +146,100 @@ pub fn render(frame: &mut Frame, app: &mut TuiApp) {
         .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(status_paragraph, status_area);
+
+    if app.file_picker.visible {
+        render_file_picker(frame, app);
+    }
+}
+
+fn render_file_picker(frame: &mut Frame, app: &mut TuiApp) {
+    let input_top = frame.area().height.saturating_sub(6);
+    let list_height = (app.file_picker.matches.len() as u16).clamp(3, 8);
+    let popup_height = list_height + 2;
+    let popup_width = frame.area().width.saturating_sub(8).min(92).max(24);
+    let area = Rect {
+        x: frame.area().x + 4,
+        y: input_top.saturating_sub(popup_height),
+        width: popup_width,
+        height: popup_height,
+    };
+    let block = Block::new()
+        .title(format!(" @ files: {}", app.file_picker.query))
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Rgb(65, 65, 65)))
+        .style(Style::new().bg(Color::Rgb(16, 16, 16)))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let items: Vec<ListItem> = if app.file_picker.matches.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No files found",
+            Style::new().fg(Color::Rgb(90, 90, 90)).add_modifier(Modifier::ITALIC),
+        )))]
+    } else {
+        app.file_picker
+            .matches
+            .iter()
+            .map(|path| {
+                ListItem::new(Line::from(Span::styled(
+                    path.clone(),
+                    Style::new().fg(Color::Rgb(190, 190, 190)),
+                )))
+            })
+            .collect()
+    };
+
+    let mut state = ListState::default().with_selected(if app.file_picker.matches.is_empty() {
+        None
+    } else {
+        Some(app.file_picker.selected)
+    });
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::new()
+                .fg(Color::Rgb(235, 235, 235))
+                .bg(Color::Rgb(45, 55, 58))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+
+    let hint_area = Rect {
+        x: area.x + 2,
+        y: area.y + area.height.saturating_sub(2),
+        width: area.width.saturating_sub(4),
+        height: 1,
+    };
+    let hint = Line::from(vec![
+        Span::styled("Type", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" filter  ", Style::new().fg(Color::Rgb(70, 70, 70))),
+        Span::styled("Enter", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" insert  ", Style::new().fg(Color::Rgb(70, 70, 70))),
+        Span::styled("Esc", Style::new().fg(Color::Rgb(95, 95, 95))),
+        Span::styled(" close", Style::new().fg(Color::Rgb(70, 70, 70))),
+    ]);
+    frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+
+
+fn format_context_usage(current: Option<usize>) -> String {
+    match current {
+        Some(current) => format!("[{}]", current),
+        None => "[--]".to_string(),
+    }
+}
+
+fn format_attachment_count(count: usize) -> String {
+    format!("[{}]", count)
+}
+
+fn format_elapsed(seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) => format!("{}s", seconds),
+        None => "--s".to_string(),
+    }
 }

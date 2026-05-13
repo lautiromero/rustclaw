@@ -4,8 +4,11 @@ use ratatui::widgets::ScrollbarState;
 use ratatui_textarea::TextArea;
 use rig::completion::Chat;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+
+const FILE_PICKER_LIMIT: usize = 50;
 
 pub enum UiEvent {
     AgentResponse(String),
@@ -23,6 +26,10 @@ pub struct TuiApp {
     pub ui_tx: mpsc::UnboundedSender<UiEvent>,
     pub ui_rx: mpsc::UnboundedReceiver<UiEvent>,
     pub pending_response: bool,
+    pub response_started_at: Option<Instant>,
+    pub last_response_elapsed_secs: Option<u64>,
+    pub current_context_tokens: Option<usize>,
+    pub current_attachment_count: usize,
     pub chat_history: Vec<rig::completion::Message>,
 
     pub mouse_capture_enabled: bool,
@@ -30,6 +37,7 @@ pub struct TuiApp {
     pub memory_db: Arc<crate::memory::sqlite::MemoryDB>,
 
     pub vertical_scroll: ScrollbarState,
+    pub file_picker: FilePickerState,
 }
 
 impl TuiApp {
@@ -56,11 +64,16 @@ impl TuiApp {
             ui_tx,
             ui_rx,
             pending_response: false,
+            response_started_at: None,
+            last_response_elapsed_secs: None,
+            current_context_tokens: None,
+            current_attachment_count: 0,
             mouse_capture_enabled: true,
             chat_history: initial_rig_history,
             session_id,
             memory_db,
             vertical_scroll: ScrollbarState::new(0),
+            file_picker: FilePickerState::default(),
         }
     }
 
@@ -76,6 +89,58 @@ impl TuiApp {
             self.vertical_scroll = ScrollbarState::new(content_height)
                 .position(current)
                 .viewport_content_length(viewport_height);
+        }
+    }
+
+    pub fn open_file_picker(&mut self) {
+        self.file_picker.visible = true;
+        self.file_picker.query.clear();
+        self.file_picker.selected = 0;
+        self.refresh_file_picker();
+    }
+
+    pub fn close_file_picker(&mut self) {
+        self.file_picker.visible = false;
+    }
+
+    pub fn file_picker_input(&mut self, ch: char) {
+        self.file_picker.query.push(ch);
+        self.file_picker.selected = 0;
+        self.refresh_file_picker();
+    }
+
+    pub fn file_picker_backspace(&mut self) {
+        self.file_picker.query.pop();
+        self.file_picker.selected = 0;
+        self.refresh_file_picker();
+    }
+
+    pub fn file_picker_next(&mut self) {
+        if !self.file_picker.matches.is_empty() {
+            self.file_picker.selected =
+                (self.file_picker.selected + 1).min(self.file_picker.matches.len() - 1);
+        }
+    }
+
+    pub fn file_picker_prev(&mut self) {
+        self.file_picker.selected = self.file_picker.selected.saturating_sub(1);
+    }
+
+    pub fn insert_selected_file(&mut self) {
+        if let Some(path) = self.file_picker.matches.get(self.file_picker.selected) {
+            self.input.insert_str(&format!("{} ", path));
+        }
+        self.close_file_picker();
+    }
+
+    fn refresh_file_picker(&mut self) {
+        self.file_picker.matches = crate::context::file_loader::discover_files(&self.file_picker.query)
+            .unwrap_or_default()
+            .into_iter()
+            .take(FILE_PICKER_LIMIT)
+            .collect();
+        if self.file_picker.selected >= self.file_picker.matches.len() {
+            self.file_picker.selected = self.file_picker.matches.len().saturating_sub(1);
         }
     }
 
@@ -110,9 +175,11 @@ impl TuiApp {
         self.conversation.auto_scroll = true;
         self.conversation.scroll_offset = 0;
 
-        // 2. Handle @file references
+        // 2. Handle @file references as one-shot attachments for this prompt.
         let file_refs = crate::context::file_loader::extract_file_references(&msg);
+        self.current_attachment_count = 0;
         let mut enriched_prompt = msg.clone();
+        let mut attached_files: Vec<String> = Vec::new();
         for file_path in &file_refs {
             let cached = {
                 let db = self.memory_db.clone();
@@ -142,11 +209,16 @@ impl TuiApp {
                     Err(_) => continue,
                 },
             };
+            attached_files.push(file_path.clone());
             enriched_prompt.push_str(&format!("\n\n[FILE: {}]\n{}\n[/FILE]", file_path, content));
         }
 
+        self.current_attachment_count = attached_files.len();
+
         // 3. Set pending + show "Thinking..."
         self.pending_response = true;
+        self.response_started_at = Some(Instant::now());
+        self.last_response_elapsed_secs = None;
         self.conversation.messages.push(UiMessage {
             role: MessageRole::System,
             content: "Thinking...".to_string(),
@@ -171,6 +243,7 @@ impl TuiApp {
         } else {
             self.chat_history.clone()
         };
+        self.current_context_tokens = Some(estimate_context_tokens(&enriched_prompt, &chat_history));
 
         // 5. Spawn async task WITH IN-CHAT DEBUG
         tokio::spawn(async move {
@@ -277,6 +350,7 @@ impl TuiApp {
                             let _ = mem.save_message(&sid, &db_msg).await;
                         });
                     }
+                    self.finish_response_timer();
                     self.pending_response = false;
                 }
                 UiEvent::AgentError(err) => {
@@ -291,6 +365,7 @@ impl TuiApp {
                         raw: None,
                         timestamp: chrono::Utc::now(),
                     });
+                    self.finish_response_timer();
                     self.pending_response = false;
                 }
                 UiEvent::NewRigMessage(rig_msg) => {
@@ -411,7 +486,38 @@ impl TuiApp {
         }
     }
 
+    pub fn response_elapsed_secs(&self) -> Option<u64> {
+        self.response_started_at
+            .map(|started| started.elapsed().as_secs())
+            .or(self.last_response_elapsed_secs)
+    }
+
+    fn finish_response_timer(&mut self) {
+        self.last_response_elapsed_secs = self
+            .response_started_at
+            .map(|started| started.elapsed().as_secs());
+        self.response_started_at = None;
+    }
+
     pub fn export_conversation_to_markdown(&self) -> String {
         crate::utils::visual_mode::export_conversation_to_markdown(&self.conversation.messages)
     }
 }
+
+#[derive(Default)]
+pub struct FilePickerState {
+    pub visible: bool,
+    pub query: String,
+    pub matches: Vec<String>,
+    pub selected: usize,
+}
+
+fn estimate_context_tokens(prompt: &str, history: &[rig::completion::Message]) -> usize {
+    let history_chars: usize = history
+        .iter()
+        .map(|msg| format!("{:?}", msg).chars().count())
+        .sum();
+    (prompt.chars().count() + history_chars).div_ceil(4)
+}
+
+

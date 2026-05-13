@@ -10,6 +10,7 @@ use rig::streaming::StreamingCompletionResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::Future;
+use std::time::Duration;
 
 // ==================== Client mínimo ====================
 #[derive(Clone)]
@@ -17,14 +18,39 @@ pub struct Client {
     api_key: String,
     base_url: String,
     http_client: reqwest::Client,
+    ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
 }
 
 impl Client {
     pub fn new(api_key: impl Into<String>) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .expect("Failed to build reqwest client");
+
         Self {
             api_key: api_key.into(),
             base_url: "https://integrate.api.nvidia.com/v1".into(),
-            http_client: reqwest::Client::new(),
+            http_client,
+            ui_tx: None,
+        }
+    }
+
+    pub fn with_ui_tx(
+        mut self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
+    ) -> Self {
+        self.ui_tx = tx;
+        self
+    }
+
+    pub fn log(&self, msg: &str) {
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.send(crate::io::tui::app::UiEvent::ToolStatus {
+                name: "nvidia".into(),
+                message: msg.into(),
+            });
         }
     }
 
@@ -135,18 +161,14 @@ impl rig::completion::CompletionModel for CompletionModel {
     ) -> impl Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>> + Send
     {
         async move {
-            // 1. Construir body para NVIDIA (con tool calling)
             let body = build_nvidia_body(&self.model, &request).map_err(|e| {
-                CompletionError::RequestError(
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string()).into(),
-                )
+                CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
             })?;
 
-            // tracing::debug!("📤 NVIDIA REQUEST | model: {} | tools_count: {}", self.model, request.tools.len());
+            // ← FIX: self.client.log(), no self.log()
+            self.client.log("Sending request...");
 
-            // tracing::info!("🔍 NVIDIA FULL REQUEST PAYLOAD:\n{}", serde_json::to_string_pretty(&body).unwrap_or_else(|_| "Failed to serialize".into()));
-
-            // 2. HTTP POST
+            let start = std::time::Instant::now();
             let resp = self
                 .client
                 .post("chat/completions")
@@ -154,43 +176,55 @@ impl rig::completion::CompletionModel for CompletionModel {
                 .send()
                 .await
                 .map_err(|e| {
-                    CompletionError::RequestError(
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()).into(),
-                    )
+                    self.client.log(&format!("Request failed: {}", e));
+                    CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
                 })?;
 
-            // 3. Check status
+            let elapsed = start.elapsed();
+            // ← FIX: self.client.log()
+            self.client.log(&format!(
+                "Response in {:.1}s (status {})",
+                elapsed.as_secs_f64(),
+                resp.status()
+            ));
+
             if !resp.status().is_success() {
-                let status = resp.status().as_u16();
-                let text = resp.text().await.unwrap_or_else(|_| "Unknown error".into());
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_else(|_| "Unknown".into());
+                self.client.log(&format!("HTTP error: {}", text));
                 return Err(CompletionError::ProviderError(format!(
                     "HTTP {}: {}",
                     status, text
                 )));
             }
 
-            // 4. Parsear respuesta
             let nvidia_resp: NvidiaResponse = resp.json().await.map_err(|e| {
-                CompletionError::RequestError(
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string()).into(),
-                )
+                CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
             })?;
 
             let message_id = nvidia_resp.id.clone();
 
-            // 5. Convertir a CompletionResponse de Rig (con tool calling)
             let first_choice = nvidia_resp
                 .choices
                 .first()
                 .ok_or_else(|| CompletionError::ProviderError("No choices in response".into()))?;
 
-            // ¿Hay tool_calls en la respuesta?
+            if let Some(tool_calls) = &first_choice.message.tool_calls {
+                for tc in tool_calls {
+                    self.client.log(&format!(
+                        "Model requested tool: {}({})",
+                        tc.function.name,
+                        tc.function.arguments.chars().take(100).collect::<String>() // Primeros 100 chars
+                    ));
+                }
+            } else {
+                self.client.log("Model returned text response (no tools)");
+            }
+
             let choice_content = if let Some(tool_calls) = &first_choice.message.tool_calls {
-                // Convertir OpenAI tool_calls a Rig ToolCall
                 let tool_calls_rig: Vec<AssistantContent> = tool_calls
                     .iter()
                     .filter_map(|tc| {
-                        // Parsear argumentos JSON
                         let args: serde_json::Value =
                             serde_json::from_str(&tc.function.arguments).ok()?;
                         Some(AssistantContent::ToolCall(ToolCall {
@@ -207,24 +241,18 @@ impl rig::completion::CompletionModel for CompletionModel {
                     .collect();
 
                 if tool_calls_rig.is_empty() {
-                    // Fallback a texto si no pudimos parsear tool calls
                     let content = first_choice.message.content.clone().unwrap_or_default();
                     vec![AssistantContent::Text(Text { text: content })]
                 } else {
                     tool_calls_rig
                 }
             } else {
-                // Respuesta normal de texto
                 let content = first_choice.message.content.clone().unwrap_or_default();
                 vec![AssistantContent::Text(Text { text: content })]
             };
 
-            tracing::debug!(
-                "📥 NVIDIA RESPONSE | id: {} | finish: {:?} | has_tool_calls: {}",
-                nvidia_resp.id,
-                first_choice.finish_reason,
-                first_choice.message.tool_calls.is_some()
-            );
+            // ← FIX: self.client.log()
+            self.client.log("Done.");
 
             Ok(CompletionResponse {
                 choice: rig::OneOrMany::many(choice_content)
@@ -272,18 +300,15 @@ fn build_nvidia_body(
 ) -> Result<serde_json::Value, anyhow::Error> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
-    // 1. Agregar preamble como system message
     if let Some(preamble) = &request.preamble {
         messages.push(json!({ "role": "system", "content": preamble }));
     }
 
-    // 2. Agregar chat_history
     for msg in request.chat_history.iter() {
         match msg {
             RigMessage::System { content } => {
                 messages.push(json!({ "role": "system", "content": content }));
             }
-
             RigMessage::User { content } => {
                 for c in content.iter() {
                     match c {
@@ -299,7 +324,7 @@ fn build_nvidia_body(
                                     rig::message::ToolResultContent::Text(Text { text }) => {
                                         Some(text.clone())
                                     }
-                                    _ => None, // ← Wildcard para ToolResultContent (Image, etc.)
+                                    _ => None,
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
@@ -313,21 +338,18 @@ fn build_nvidia_body(
                     }
                 }
             }
-
             RigMessage::Assistant { content, .. } => {
-                // Extraer texto, pero loguear si hay tool_calls o reasoning
                 let text = content
                     .iter()
                     .filter_map(|c| match c {
                         AssistantContent::Text(Text { text }) => Some(text.clone()),
                         AssistantContent::ToolCall(tc) => {
-                            // 🔍 LOG: ver tool_call que Rig quiere enviar
                             tracing::debug!(
-                                "🔧 AssistantContent::ToolCall detected: name={}, id={}",
+                                "🔧 AssistantContent::ToolCall: name={}, id={}",
                                 tc.function.name,
                                 tc.id
                             );
-                            None // No incluir tool_calls en "content", van en campo separado
+                            None
                         }
                         other => {
                             tracing::debug!(
@@ -344,19 +366,16 @@ fn build_nvidia_body(
         }
     }
 
-    // ver cuántos mensajes y si hay vacíos
     for (i, msg) in messages.iter().enumerate() {
         if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
             if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                // Solo warnear si es user/system con contenido vacío (tool results vacíos sí son problema)
                 if content.is_empty() && role != "assistant" {
-                    tracing::warn!("⚠️ Mensaje {} con role '{}' tiene contenido vacío", i, role);
+                    tracing::warn!("⚠️ Message {} with role '{}' has empty content", i, role);
                 }
             }
         }
     }
 
-    // 3. Construir body principal
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -365,7 +384,6 @@ fn build_nvidia_body(
         "stream": false
     });
 
-    // 4. Tool calling (formato OpenAI-compatible)
     if !request.tools.is_empty() {
         let tools_openai: Vec<serde_json::Value> = request
             .tools
@@ -388,7 +406,6 @@ fn build_nvidia_body(
         body["tool_choice"] = serde_json::to_value(tool_choice)?;
     }
 
-    // 5. Merge additional_params
     if let Some(extra) = &request.additional_params {
         if let (Some(obj), serde_json::Value::Object(extra_obj)) = (body.as_object_mut(), extra) {
             for (k, v) in extra_obj {
@@ -400,7 +417,6 @@ fn build_nvidia_body(
     Ok(body)
 }
 
-// ==================== Debug seguro ====================
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NvidiaClient")

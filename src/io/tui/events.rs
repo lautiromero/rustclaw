@@ -93,6 +93,26 @@ pub fn run_tui(
                 continue;
             }
 
+            if app.file_picker.visible {
+                if let crossterm::event::Event::Key(key_event) = &crossterm_event
+                    && key_event.kind == crossterm::event::KeyEventKind::Press
+                {
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    match key_event.code {
+                        KeyCode::Esc => app.close_file_picker(),
+                        KeyCode::Enter => app.insert_selected_file(),
+                        KeyCode::Up => app.file_picker_prev(),
+                        KeyCode::Down => app.file_picker_next(),
+                        KeyCode::Backspace => app.file_picker_backspace(),
+                        KeyCode::Char(ch) if key_event.modifiers == KeyModifiers::NONE => {
+                            app.file_picker_input(ch)
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             if let crossterm::event::Event::Key(key_event) = &crossterm_event
                 && key_event.kind == crossterm::event::KeyEventKind::Press
                 && !app.mouse_capture_enabled
@@ -157,7 +177,22 @@ pub fn run_tui(
                 }
                 input => {
                     if !app.pending_response {
+                        let opens_file_picker = matches!(
+                            input,
+                            Input {
+                                key: ratatui_textarea::Key::Char('@'),
+                                ctrl: false,
+                                shift: false,
+                                alt: false,
+                                ..
+                            }
+                        );
+
                         app.input.input(input);
+
+                        if opens_file_picker {
+                            app.open_file_picker();
+                        }
                     }
                 }
             }

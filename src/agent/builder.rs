@@ -5,11 +5,12 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::context::vector_store::AppVectorStore;
 use crate::memory::sqlite::MemoryDB;
-use crate::providers::nvidia;
+// use crate::providers::nvidia;
+use super::AppAgent;
 use crate::tools::ReadFileTool;
 use crate::tools::memory::{recall::RecallTool, save_fact::SaveFactTool};
-
-use super::AppAgent;
+use rig::prelude::CompletionClient;
+use rig::providers::openai::CompletionsClient;
 
 pub async fn build_agent<M>(
     config: &Config,
@@ -23,8 +24,17 @@ where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
     // NVIDIA client for LLM
-    let client = nvidia::Client::new(&config.nvidia_api_key).base_url(&config.nvidia_base_url);
-    let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
+    // let client = nvidia::Client::new(&config.nvidia_api_key)
+    //     .base_url(&config.nvidia_base_url)
+    //     .with_ui_tx(ui_tx.clone());
+    // let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
+
+    let client = CompletionsClient::builder()
+        .api_key(&config.nvidia_api_key)
+        .base_url(&config.nvidia_base_url) // ← Tu orquestador
+        .build()?;
+
+    let llm_model = client.completion_model(&config.llm_model);
 
     // Índice para docs/código (rig.dynamic_context)
     let index = vector_store.index(embed_model);
@@ -40,40 +50,19 @@ where
     let global_block = if global_facts.is_empty() {
         String::new()
     } else {
-        let rules = global_facts
+        global_facts
             .iter()
-            .map(|(k, v)| format!("• {}: {}", k, v))
+            .map(|(k, v)| format!("[{}] {}", k, v))
             .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "\nGLOBAL RULES (apply to EVERY response, never override):\n{}\n",
-            rules
-        )
+            .join(" | ")
     };
 
-    // 2. Preamble definitivo
+    // 2. Preamble
     let preamble = format!(
-        "You are a highly adaptive technical assistant.{}
-MEMORY PROTOCOL:
-1. GLOBAL RULES above apply to EVERY response. Apply them silently.
-2. Identify the main topic(s) of the conversation: coding, cooking, betting, medicine, linux, music, etc. (open-ended).
-3. For each relevant topic, call recall_memory(query=\"topic\") to load ALL rules for that domain.
-   - Example: recall_memory(\"coding\") returns coding_language, coding_style, etc.
-   - You can call recall_memory multiple times if multiple topics apply (e.g., coding + linux).
-4. Apply loaded topic rules silently. Do not ask the user about them.
-5. When saving new facts: use key=\"topic_subkey\" format.
-   - Topics: coding, cooking, betting, medicine, linux, music, general, etc.
-   - Examples: \"coding_language\", \"linux_shell\", \"general_name\", \"betting_odds_format\".
-   - Use \"general_*\" for rules that apply everywhere (they will appear in GLOBAL RULES).
-
-DEFAULTS (if no relevant facts found):
-- Chat language: match user's language
-- Code/comments/logs: English
-- No emojis in code or logs
-
-RESPONSE FORMAT:
-- Be concise and technical when appropriate.
-- Stop calling tools once you have necessary context.",
+        "Technical assistant.{}
+- Recall: specific topics only, once. Never 'general'.
+- Language: match user.
+- Output: direct answer only. No meta-commentary. No process explanations.",
         global_block
     );
 
