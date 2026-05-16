@@ -138,11 +138,12 @@ impl TuiApp {
     }
 
     fn refresh_file_picker(&mut self) {
-        self.file_picker.matches = crate::context::file_loader::discover_files(&self.file_picker.query)
-            .unwrap_or_default()
-            .into_iter()
-            .take(FILE_PICKER_LIMIT)
-            .collect();
+        self.file_picker.matches =
+            crate::context::file_loader::discover_files(&self.file_picker.query)
+                .unwrap_or_default()
+                .into_iter()
+                .take(FILE_PICKER_LIMIT)
+                .collect();
         if self.file_picker.selected >= self.file_picker.matches.len() {
             self.file_picker.selected = self.file_picker.matches.len().saturating_sub(1);
         }
@@ -199,19 +200,29 @@ impl TuiApp {
 
             let content = match cached {
                 Some(c) => c,
-                None => match crate::context::file_loader::read_file_text(file_path) {
-                    Ok(c) => {
-                        let db = self.memory_db.clone();
-                        let s = self.session_id.clone();
-                        let p = file_path.clone();
-                        let c_clone = c.clone();
-                        tokio::spawn(async move {
-                            crate::context::file_cache::store_in_cache(&db, &s, &p, &c_clone).await;
-                        });
-                        c
+                None => {
+                    let clean_path = file_path.trim_start_matches('@');
+                    match crate::context::file_loader::read_file_text(clean_path) {
+                        Ok(c) => {
+                            let db = self.memory_db.clone();
+                            let s = self.session_id.clone();
+                            let p = file_path.clone();
+                            let c_clone = c.clone();
+                            tokio::spawn(async move {
+                                crate::context::file_cache::store_in_cache(&db, &s, &p, &c_clone)
+                                    .await;
+                            });
+                            c
+                        }
+                        Err(e) => {
+                            let _ = self.ui_tx.send(UiEvent::ToolStatus {
+                                name: "system".into(),
+                                message: format!("Failed to read {}: {}", file_path, e),
+                            });
+                            continue;
+                        }
                     }
-                    Err(_) => continue,
-                },
+                }
             };
             attached_files.push(file_path.clone());
             enriched_prompt.push_str(&format!("\n\n[FILE: {}]\n{}\n[/FILE]", file_path, content));
@@ -247,15 +258,31 @@ impl TuiApp {
         } else {
             self.chat_history.clone()
         };
-        self.current_context_tokens = Some(estimate_context_tokens(&enriched_prompt, &chat_history));
+        self.current_context_tokens =
+            Some(estimate_context_tokens(&enriched_prompt, &chat_history));
 
-        // 5. Spawn async task WITH IN-CHAT DEBUG
+        // 5. Persist User message to history and DB
+        let user_rig_msg = rig::completion::Message::User {
+            content: rig::OneOrMany::one(rig::message::UserContent::Text(rig::message::Text {
+                text: enriched_prompt.clone(),
+            })),
+        };
+
+        // Save to local history (for future turns)
+        self.chat_history.push(user_rig_msg.clone());
+
+        // Save to DB
+        let db_mem = self.memory_db.clone();
+        let db_sid = self.session_id.clone();
         tokio::spawn(async move {
-            let _ = ui_tx.send(UiEvent::ToolStatus {
-                name: "agent".into(),
-                message: "Locking agent...".into(),
-            });
+            if let Ok(db_msg) = crate::memory::serialization::rig_to_db(&db_sid, &user_rig_msg) {
+                use crate::memory::session_store::SessionStore;
+                let _ = db_mem.save_message(&db_sid, &db_msg).await;
+            }
+        });
 
+        // 6. Spawn async task WITH IN-CHAT DEBUG
+        tokio::spawn(async move {
             let agent_locked = agent.lock().await;
 
             let _ = ui_tx.send(UiEvent::ToolStatus {
@@ -269,32 +296,18 @@ impl TuiApp {
             )
             .await;
 
-            let status_msg = match &result {
-                Ok(Ok(resp)) => format!("LLM responded ({} chars)", resp.len()),
-                Ok(Err(e)) => format!("LLM error: {}", e),
-                Err(_) => format!("Timeout after {}s", timeout_duration.as_secs()),
-            };
-            let _ = ui_tx.send(UiEvent::ToolStatus {
-                name: "agent".into(),
-                message: status_msg,
-            });
+            // let status_msg = match &result {
+            //     // Ok(Ok(resp)) => format!("LLM responded ({} chars)", resp.len()),
+            //     Ok(Err(e)) => format!("LLM error: {}", e),
+            //     Err(_) => format!("Timeout after {}s", timeout_duration.as_secs()),
+            // };
+            // let _ = ui_tx.send(UiEvent::ToolStatus {
+            //     name: "agent".into(),
+            //     message: status_msg,
+            // });
 
             match result {
                 Ok(Ok(resp)) => {
-                    if let Ok(db_msg) = crate::memory::serialization::rig_to_db(
-                        &session_id,
-                        &rig::completion::Message::User {
-                            content: rig::OneOrMany::one(rig::message::UserContent::Text(
-                                rig::message::Text {
-                                    text: user_text_for_db,
-                                },
-                            )),
-                        },
-                    ) {
-                        use crate::memory::session_store::SessionStore;
-                        let _ = memory_db.save_message(&session_id, &db_msg).await;
-                    }
-
                     let _ = ui_tx.send(UiEvent::AgentResponse(resp.clone()));
                     let _ = ui_tx.send(UiEvent::NewRigMessage(
                         rig::completion::Message::Assistant {
@@ -523,5 +536,3 @@ fn estimate_context_tokens(prompt: &str, history: &[rig::completion::Message]) -
         .sum();
     (prompt.chars().count() + history_chars).div_ceil(4)
 }
-
-

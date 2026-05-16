@@ -157,6 +157,24 @@ pub fn run_tui(
                 } => {}
                 Input {
                     key: ratatui_textarea::Key::Enter,
+                    shift: true,
+                    alt: false,
+                    ctrl: false,
+                    ..
+                } => {
+                    app.input.insert_newline();
+                }
+                Input {
+                    key: ratatui_textarea::Key::Enter,
+                    shift: false,
+                    alt: true,
+                    ctrl: false,
+                    ..
+                } => {
+                    app.input.insert_newline();
+                }
+                Input {
+                    key: ratatui_textarea::Key::Enter,
                     shift: false,
                     alt: false,
                     ctrl: false,

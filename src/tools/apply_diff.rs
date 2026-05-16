@@ -2,19 +2,56 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ApplyDiffError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Parse error: {0}")]
-    Parse(String),
     #[error("Apply error: {0}")]
     Apply(String),
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-pub struct ApplyDiffTool;
+pub struct ApplyDiffArgs {
+    pub path: String,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub replace: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<ApplyDiffEdit>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ApplyDiffEdit {
+    pub search: String,
+    pub replace: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ApplyDiffTool {
+    #[serde(skip)]
+    pub ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
+}
+
+impl ApplyDiffTool {
+    pub fn new(
+        ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
+    ) -> Self {
+        Self { ui_tx }
+    }
+
+    fn log(&self, msg: &str) {
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.send(crate::io::tui::app::UiEvent::ToolStatus {
+                name: "apply_diff".into(),
+                message: msg.into(),
+            });
+        }
+    }
+}
 
 impl Tool for ApplyDiffTool {
     const NAME: &'static str = "apply_diff";
@@ -25,24 +62,44 @@ impl Tool for ApplyDiffTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.into(),
-            description: "Applies a SEARCH/REPLACE diff to a file. Format:\n<<<<<<< SEARCH\n<exact original lines>\n=======\n<new lines>\n>>>>>>> REPLACE\nSupports multiple blocks. Creates .bak backup on success.".into(),
+            description: "Replaces one or more exact or whitespace-tolerant code blocks in a file. Prefer using 'edits' for multiple changes so they are validated and applied atomically. Matching is tolerant to trailing whitespace and newline style (\\r\\n vs \\n). For backwards compatibility, a single edit can also be provided with top-level 'search' and 'replace'.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Relative path to target file" },
-                    "diff": { "type": "string", "description": "SEARCH/REPLACE blocks" }
+                    "path": { "type": "string", "description": "Relative path to target file from project root" },
+                    "search": { "type": "string", "description": "Single-edit compatibility mode: code block to find. Prefer 'edits' for new calls." },
+                    "replace": { "type": "string", "description": "Single-edit compatibility mode: replacement code block. Prefer 'edits' for new calls." },
+                    "edits": {
+                        "type": "array",
+                        "description": "List of replacements to apply atomically. All searches must match exactly one location before any write occurs.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": { "type": "string", "description": "Code block to find. Copy it from read_file output, including indentation and enough surrounding context to make it unique." },
+                                "replace": { "type": "string", "description": "Replacement code block. Use the same indentation style as the surrounding code." }
+                            },
+                            "required": ["search", "replace"],
+                            "additionalProperties": false
+                        }
+                    }
                 },
-                "required": ["path", "diff"]
+                "required": ["path"],
+                "additionalProperties": false
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.log(&format!("Applying change to: {}", args.path));
+
+        let edits = collect_edits(&args)?;
+        validate_edits(&edits)?;
+
         let project_root = crate::context::file_loader::get_project_root()
             .map_err(|e| ApplyDiffError::Apply(e.to_string()))?;
+        let canonical_root = project_root.canonicalize()?;
 
-        let file_path = project_root.join(&args.path);
-
+        let file_path: PathBuf = project_root.join(&args.path);
         if !file_path.exists() || !file_path.is_file() {
             return Err(ApplyDiffError::Apply(format!(
                 "File not found: {}",
@@ -50,127 +107,289 @@ impl Tool for ApplyDiffTool {
             )));
         }
 
-        let original = fs::read_to_string(&file_path)?;
-        let modified = apply_search_replace_blocks(&original, &args.diff)?;
-
-        if modified == original {
-            return Ok(
-                "⚠️ No changes applied. SEARCH blocks didn't match or diff was empty.".into(),
-            );
+        let canonical_file = file_path.canonicalize()?;
+        if !canonical_file.starts_with(&canonical_root) {
+            return Err(ApplyDiffError::Apply(format!(
+                "Path escapes project root: {}",
+                args.path
+            )));
         }
 
-        let backup_path = file_path.with_extension("bak");
+        let original = fs::read_to_string(&canonical_file).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                ApplyDiffError::Apply(format!(
+                    "File is not valid UTF-8 and cannot be edited as text: {}",
+                    args.path
+                ))
+            } else {
+                ApplyDiffError::Io(e)
+            }
+        })?;
+        // self.log(&format!("Read {} bytes", original.len()));
+
+        let mut planned_edits = Vec::new();
+        for (idx, edit) in edits.iter().enumerate() {
+            let matches = find_tolerant_matches(&original, &edit.search);
+
+            match matches.len() {
+                0 => {
+                    let file_preview = original.chars().take(500).collect::<String>();
+                    let search_preview = edit.search.chars().take(250).collect::<String>();
+                    return Err(ApplyDiffError::Apply(format!(
+                        "Search string for edit {} not found in '{}'. File size: {} bytes. File preview: {:?} | Search preview: {:?}",
+                        idx + 1,
+                        args.path,
+                        original.len(),
+                        file_preview,
+                        search_preview
+                    )));
+                }
+                1 => planned_edits.push(PlannedEdit {
+                    index: idx + 1,
+                    range: matches[0].clone(),
+                    replace: edit.replace.clone(),
+                }),
+                _ => {
+                    return Err(ApplyDiffError::Apply(format!(
+                        "Search string for edit {} matched {} locations. Make it more specific to target a single occurrence.",
+                        idx + 1,
+                        matches.len()
+                    )));
+                }
+            }
+        }
+
+        validate_non_overlapping(&planned_edits)?;
+
+        let mut modified = original.clone();
+        planned_edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+        for edit in &planned_edits {
+            modified.replace_range(edit.range.clone(), &edit.replace);
+        }
+
+        if modified == original {
+            return Ok(format!(
+                "No changes needed for '{}'. Content already matches.",
+                args.path
+            ));
+        }
+
+        let backup_path = backup_path(&canonical_file);
         fs::write(&backup_path, &original)?;
-        fs::write(&file_path, &modified)?;
+        atomic_write(&canonical_file, &modified)?;
 
         Ok(format!(
-            "✅ Applied diff to '{}'. Backup: '{}'.\n\nChanges preview:\n{}",
+            "Applied {} edit(s) to '{}'. Original size: {} bytes. New size: {} bytes. Backup: '{}'.",
+            planned_edits.len(),
             args.path,
-            backup_path.display(),
-            generate_preview(&original, &modified)
+            original.len(),
+            modified.len(),
+            backup_path.display()
         ))
     }
 }
 
-fn apply_search_replace_blocks(content: &str, diff: &str) -> Result<String, ApplyDiffError> {
-    let mut current = content.to_string();
-    let blocks = parse_diff_blocks(diff)?;
+#[derive(Clone)]
+struct PlannedEdit {
+    index: usize,
+    range: std::ops::Range<usize>,
+    replace: String,
+}
 
-    for (search, replace) in blocks {
-        let search_trimmed = search.trim();
-        if search_trimmed.is_empty() {
-            return Err(ApplyDiffError::Parse("Empty SEARCH block".into()));
-        }
+fn collect_edits(args: &ApplyDiffArgs) -> Result<Vec<ApplyDiffEdit>, ApplyDiffError> {
+    let has_legacy_search = args.search.is_some();
+    let has_legacy_replace = args.replace.is_some();
+    let has_structured_edits = !args.edits.is_empty();
 
-        current = current.replace(search_trimmed, replace.trim());
-    }
-
-    if current == content {
+    if has_structured_edits && (has_legacy_search || has_legacy_replace) {
         return Err(ApplyDiffError::Apply(
-            "SEARCH blocks not found in file. Ensure exact match.".into(),
+            "Use either 'edits' or top-level 'search'/'replace', not both".into(),
         ));
     }
 
-    Ok(current)
+    if has_structured_edits {
+        return Ok(args.edits.clone());
+    }
+
+    match (&args.search, &args.replace) {
+        (Some(search), Some(replace)) => Ok(vec![ApplyDiffEdit {
+            search: search.clone(),
+            replace: replace.clone(),
+        }]),
+        (None, None) => Err(ApplyDiffError::Apply(
+            "Provide either 'edits' or top-level 'search' and 'replace'".into(),
+        )),
+        _ => Err(ApplyDiffError::Apply(
+            "Top-level 'search' and 'replace' must be provided together".into(),
+        )),
+    }
 }
 
-fn parse_diff_blocks(diff: &str) -> Result<Vec<(String, String)>, ApplyDiffError> {
-    let mut blocks = Vec::new();
-    let mut search = String::new();
-    let mut replace = String::new();
-    let mut in_block = false;
-    let mut is_search = true;
+fn validate_edits(edits: &[ApplyDiffEdit]) -> Result<(), ApplyDiffError> {
+    if edits.is_empty() {
+        return Err(ApplyDiffError::Apply("'edits' cannot be empty".into()));
+    }
 
-    for line in diff.lines() {
-        if line.starts_with("<<<<<<< SEARCH") {
-            if in_block {
-                return Err(ApplyDiffError::Parse("Unclosed SEARCH block".into()));
-            }
-            in_block = true;
-            is_search = true;
-            continue;
-        }
-        if line.starts_with("=======") {
-            if !in_block || !is_search {
-                return Err(ApplyDiffError::Parse("Invalid block structure".into()));
-            }
-            is_search = false;
-            continue;
-        }
-        if line.starts_with(">>>>>>> REPLACE") {
-            if !in_block || is_search {
-                return Err(ApplyDiffError::Parse("Invalid block structure".into()));
-            }
-            blocks.push((search.clone(), replace.clone()));
-            search.clear();
-            replace.clear();
-            in_block = false;
-            continue;
-        }
-        if !in_block {
-            continue;
+    for (idx, edit) in edits.iter().enumerate() {
+        if edit.search.is_empty() {
+            return Err(ApplyDiffError::Apply(format!(
+                "'search' for edit {} cannot be empty",
+                idx + 1
+            )));
         }
 
-        if is_search {
-            search.push_str(line);
-            search.push('\n');
-        } else {
-            replace.push_str(line);
-            replace.push('\n');
+        if edit.search.trim().is_empty() {
+            return Err(ApplyDiffError::Apply(format!(
+                "'search' for edit {} cannot contain only whitespace",
+                idx + 1
+            )));
         }
     }
 
-    if in_block {
-        return Err(ApplyDiffError::Parse("Unclosed diff block".into()));
-    }
-    if blocks.is_empty() {
-        return Err(ApplyDiffError::Parse(
-            "No valid SEARCH/REPLACE blocks found".into(),
-        ));
-    }
-
-    Ok(blocks)
+    Ok(())
 }
 
-fn generate_preview(original: &str, modified: &str) -> String {
-    let orig_lines: Vec<&str> = original.lines().collect();
-    let mod_lines: Vec<&str> = modified.lines().collect();
+fn validate_non_overlapping(edits: &[PlannedEdit]) -> Result<(), ApplyDiffError> {
+    let mut sorted = edits.to_vec();
+    sorted.sort_by_key(|edit| edit.range.start);
 
-    let mut preview = String::new();
-    for (i, (o, m)) in orig_lines.iter().zip(mod_lines.iter()).enumerate() {
-        if o != m {
-            preview.push_str(&format!("L{}: - {}\nL{}: + {}\n", i + 1, o, i + 1, m));
-            if preview.lines().count() > 8 {
-                preview.push_str("... (truncated)\n");
-                break;
+    for pair in sorted.windows(2) {
+        let current = &pair[0];
+        let next = &pair[1];
+        if current.range.end > next.range.start {
+            return Err(ApplyDiffError::Apply(format!(
+                "Edit {} overlaps edit {}. Make the edits independent or combine them into one replacement.",
+                current.index, next.index
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn find_tolerant_matches(original: &str, search: &str) -> Vec<std::ops::Range<usize>> {
+    let (original_norm, ranges) = normalize_with_ranges(original);
+    let (search_norm, _) = normalize_with_ranges(search);
+
+    original_norm
+        .match_indices(&search_norm)
+        .filter_map(|(start, matched)| {
+            normalized_match_to_original_range(start, start + matched.len(), &ranges)
+        })
+        .collect()
+}
+
+fn normalize_with_ranges(s: &str) -> (String, Vec<(usize, std::ops::Range<usize>)>) {
+    let mut normalized = String::new();
+    let mut ranges = Vec::new();
+    let mut pending_whitespace: Vec<(char, std::ops::Range<usize>)> = Vec::new();
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        let next_byte = chars
+            .get(idx + 1)
+            .map(|(next_idx, _)| *next_idx)
+            .unwrap_or_else(|| s.len());
+
+        match ch {
+            ' ' | '\t' => {
+                pending_whitespace.push((ch, byte_idx..next_byte));
+                idx += 1;
+            }
+            '\r' | '\n' => {
+                pending_whitespace.clear();
+
+                let newline_end = if ch == '\r'
+                    && chars.get(idx + 1).map(|(_, next_ch)| *next_ch) == Some('\n')
+                {
+                    idx += 1;
+                    chars
+                        .get(idx + 1)
+                        .map(|(next_idx, _)| *next_idx)
+                        .unwrap_or_else(|| s.len())
+                } else {
+                    next_byte
+                };
+
+                push_normalized_char(&mut normalized, &mut ranges, '\n', byte_idx..newline_end);
+                idx += 1;
+            }
+            _ => {
+                for (pending_ch, pending_range) in pending_whitespace.drain(..) {
+                    push_normalized_char(&mut normalized, &mut ranges, pending_ch, pending_range);
+                }
+                push_normalized_char(&mut normalized, &mut ranges, ch, byte_idx..next_byte);
+                idx += 1;
             }
         }
     }
-    preview
+
+    (normalized, ranges)
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-pub struct ApplyDiffArgs {
-    pub path: String,
-    pub diff: String,
+fn push_normalized_char(
+    normalized: &mut String,
+    ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
+    ch: char,
+    original_range: std::ops::Range<usize>,
+) {
+    let normalized_byte = normalized.len();
+    normalized.push(ch);
+    ranges.push((normalized_byte, original_range));
 }
+
+fn normalized_match_to_original_range(
+    start: usize,
+    end: usize,
+    ranges: &[(usize, std::ops::Range<usize>)],
+) -> Option<std::ops::Range<usize>> {
+    let first_idx = ranges
+        .iter()
+        .position(|(normalized_byte, _)| *normalized_byte == start)?;
+    let last_idx = ranges
+        .iter()
+        .enumerate()
+        .take_while(|(_, (normalized_byte, _))| *normalized_byte < end)
+        .map(|(idx, _)| idx)
+        .last()?;
+
+    Some(ranges[first_idx].1.start..ranges[last_idx].1.end)
+}
+
+fn backup_path(file_path: &std::path::Path) -> PathBuf {
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+
+    file_path.with_file_name(format!("{}.bak", file_name))
+}
+
+fn atomic_write(file_path: &std::path::Path, content: &str) -> Result<(), std::io::Error> {
+    let metadata = fs::metadata(file_path)?;
+    let permissions = metadata.permissions();
+    let temp_path = unique_temp_path(file_path);
+
+    fs::write(&temp_path, content)?;
+    fs::set_permissions(&temp_path, permissions)?;
+    fs::rename(&temp_path, file_path)?;
+
+    Ok(())
+}
+
+fn unique_temp_path(file_path: &std::path::Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+
+    file_path.with_file_name(format!("{}.tmp.{}", file_name, timestamp))
+}
+
+// Built with care for the Maestro: every clean diff is a tiny love letter to the craft.

@@ -2,15 +2,14 @@ use anyhow::Result;
 use serde_json::json;
 use std::sync::Arc;
 
+use super::AppAgent;
 use crate::config::Config;
 use crate::context::vector_store::AppVectorStore;
+use crate::io::tui::app::UiEvent;
 use crate::memory::sqlite::MemoryDB;
-// use crate::providers::nvidia;
-use super::AppAgent;
+use crate::providers::nvidia;
 use crate::tools::ReadFileTool;
 use crate::tools::memory::{recall::RecallTool, save_fact::SaveFactTool};
-use rig::prelude::CompletionClient;
-use rig::providers::openai::CompletionsClient;
 
 pub async fn build_agent<M>(
     config: &Config,
@@ -23,18 +22,11 @@ pub async fn build_agent<M>(
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    // NVIDIA client for LLM
-    // let client = nvidia::Client::new(&config.nvidia_api_key)
-    //     .base_url(&config.nvidia_base_url)
-    //     .with_ui_tx(ui_tx.clone());
-    // let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
-
-    let client = CompletionsClient::builder()
-        .api_key(&config.nvidia_api_key)
-        .base_url(&config.nvidia_base_url) // ← Tu orquestador
-        .build()?;
-
-    let llm_model = client.completion_model(&config.llm_model);
+    // Custom NVIDIA-compatible client so we can inspect the final HTTP body in the chat.
+    let client = nvidia::Client::new(&config.nvidia_api_key)
+        .base_url(&config.nvidia_base_url)
+        .with_ui_tx(ui_tx.clone());
+    let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
 
     // Índice para docs/código (rig.dynamic_context)
     let index = vector_store.index(embed_model);
@@ -58,20 +50,32 @@ where
     };
 
     // 2. Preamble
-    let preamble = format!(
-        "Technical assistant.{}
+    let preamble = if global_block.is_empty() {
+        "Technical assistant.
+- Recall: specific topics only, once. Never 'general'.
+- Language: match user.
+- Output: direct answer only. No meta-commentary. No process explanations."
+            .to_string()
+    } else {
+        format!(
+            "Technical assistant.
+
+Persistent global facts:
+{}
+
 - Recall: specific topics only, once. Never 'general'.
 - Language: match user.
 - Output: direct answer only. No meta-commentary. No process explanations.",
-        global_block
-    );
+            global_block
+        )
+    };
 
     // 3. Crear tools
     let save_tool = SaveFactTool::new(memory_db.clone());
     let file_reader_tool = ReadFileTool::new(memory_db.clone(), session_id.clone());
     let recall_tool = RecallTool::new(memory_db.clone());
-    let read_dir_tool = crate::tools::read_dir::ReadDirTool::new(ui_tx);
-    let apply_diff_tool = crate::tools::ApplyDiffTool;
+    let read_dir_tool = crate::tools::read_dir::ReadDirTool::new(ui_tx.clone());
+    let apply_diff_tool = crate::tools::ApplyDiffTool::new(ui_tx.clone());
     let write_file_tool = crate::tools::WriteFileTool;
 
     let agent = rig::agent::AgentBuilder::new(llm_model)
@@ -89,12 +93,6 @@ where
         .tool(write_file_tool)
         .default_max_turns(config.max_turns as usize)
         .build();
-
-    tracing::info!(
-        "🔧 Agent built | model: {} | tools: 3 | session: {}",
-        config.llm_model,
-        session_id
-    );
 
     Ok(agent)
 }

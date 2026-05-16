@@ -18,8 +18,22 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
+    fn load_env() {
+        if let Some(env_path) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join(".config").join("rustclaw").join(".env"))
+            .filter(|path| path.exists())
+        {
+            dotenvy::from_path(env_path).ok();
+            return;
+        }
+
         dotenvy::dotenv().ok();
+    }
+
+    pub fn load() -> Result<Self> {
+        Self::load_env();
+
         Ok(Self {
             nvidia_api_key: std::env::var("NVIDIA_API_KEY").context("Falta NVIDIA_API_KEY")?,
             nvidia_base_url: std::env::var("NVIDIA_BASE_URL")

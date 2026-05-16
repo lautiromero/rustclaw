@@ -1,0 +1,280 @@
+use rig::completion::ToolDefinition;
+use rig::tool::Tool;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(thiserror::Error, Debug)]
+pub enum ApplyDiffError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Apply error: {0}")]
+    Apply(String),
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ApplyDiffArgs {
+    pub path: String,
+    pub search: String,
+    pub replace: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ApplyDiffTool {
+    #[serde(skip)]
+    pub ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
+}
+
+impl ApplyDiffTool {
+    pub fn new(
+        ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
+    ) -> Self {
+        Self { ui_tx }
+    }
+
+    fn log(&self, msg: &str) {
+        if let Some(tx) = &self.ui_tx {
+            let _ = tx.send(crate::io::tui::app::UiEvent::ToolStatus {
+                name: "apply_diff".into(),
+                message: msg.into(),
+            });
+        }
+    }
+}
+
+impl Tool for ApplyDiffTool {
+    const NAME: &'static str = "apply_diff";
+    type Error = ApplyDiffError;
+    type Args = ApplyDiffArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.into(),
+            description: "Replaces a single exact or whitespace-tolerant code block in a file. Provide the exact substring to find in 'search' and the replacement in 'replace'. Matching is tolerant to trailing whitespace and newline style (\\r\\n vs \\n).".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path to target file from project root" },
+                    "search": { "type": "string", "description": "Code block to find. Prefer copying it from read_file output, including indentation and enough surrounding context to make it unique." },
+                    "replace": { "type": "string", "description": "Replacement code block. Use the same indentation style as the surrounding code." }
+                },
+                "required": ["path", "search", "replace"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.log(&format!("Applying change to: {}", args.path));
+
+        if args.search.is_empty() {
+            return Err(ApplyDiffError::Apply("'search' cannot be empty".into()));
+        }
+
+        if args.search.trim().is_empty() {
+            return Err(ApplyDiffError::Apply(
+                "'search' cannot contain only whitespace".into(),
+            ));
+        }
+
+        let project_root = crate::context::file_loader::get_project_root()
+            .map_err(|e| ApplyDiffError::Apply(e.to_string()))?;
+        let canonical_root = project_root.canonicalize()?;
+
+        let file_path: PathBuf = project_root.join(&args.path);
+        if !file_path.exists() || !file_path.is_file() {
+            return Err(ApplyDiffError::Apply(format!(
+                "File not found: {}",
+                args.path
+            )));
+        }
+
+        let canonical_file = file_path.canonicalize()?;
+        if !canonical_file.starts_with(&canonical_root) {
+            return Err(ApplyDiffError::Apply(format!(
+                "Path escapes project root: {}",
+                args.path
+            )));
+        }
+
+        let original = fs::read_to_string(&canonical_file).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                ApplyDiffError::Apply(format!(
+                    "File is not valid UTF-8 and cannot be edited as text: {}",
+                    args.path
+                ))
+            } else {
+                ApplyDiffError::Io(e)
+            }
+        })?;
+        self.log(&format!("Read {} bytes", original.len()));
+
+        // Search using newline and trailing-whitespace tolerant matching.
+        let matches = find_tolerant_matches(&original, &args.search);
+
+        match matches.len() {
+            0 => {
+                let file_preview = original.chars().take(500).collect::<String>();
+                let search_preview = args.search.chars().take(250).collect::<String>();
+                return Err(ApplyDiffError::Apply(format!(
+                    "Search string not found in '{}'. File size: {} bytes. File preview: {:?} | Search preview: {:?}",
+                    args.path,
+                    original.len(),
+                    file_preview,
+                    search_preview
+                )));
+            }
+            1 => {
+                let range = matches[0].clone();
+                let mut modified = original.clone();
+                modified.replace_range(range, &args.replace);
+
+                if modified == original {
+                    return Ok(format!(
+                        "No changes needed for '{}'. Content already matches.",
+                        args.path
+                    ));
+                }
+
+                let backup_path = backup_path(&canonical_file);
+                fs::write(&backup_path, &original)?;
+                atomic_write(&canonical_file, &modified)?;
+
+                Ok(format!(
+                    "Applied change to '{}'. Replaced 1 occurrence. Original size: {} bytes. New size: {} bytes. Backup: '{}'.",
+                    args.path,
+                    original.len(),
+                    modified.len(),
+                    backup_path.display()
+                ))
+            }
+            _ => {
+                return Err(ApplyDiffError::Apply(format!(
+                    "Search string matched {} locations. Make it more specific to target a single occurrence.",
+                    matches.len()
+                )));
+            }
+        }
+    }
+}
+
+fn find_tolerant_matches(original: &str, search: &str) -> Vec<std::ops::Range<usize>> {
+    let (original_norm, ranges) = normalize_with_ranges(original);
+    let (search_norm, _) = normalize_with_ranges(search);
+
+    original_norm
+        .match_indices(&search_norm)
+        .filter_map(|(start, matched)| normalized_match_to_original_range(start, start + matched.len(), &ranges))
+        .collect()
+}
+
+fn normalize_with_ranges(s: &str) -> (String, Vec<(usize, std::ops::Range<usize>)>) {
+    let mut normalized = String::new();
+    let mut ranges = Vec::new();
+    let mut pending_whitespace: Vec<(char, std::ops::Range<usize>)> = Vec::new();
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        let next_byte = chars
+            .get(idx + 1)
+            .map(|(next_idx, _)| *next_idx)
+            .unwrap_or_else(|| s.len());
+
+        match ch {
+            ' ' | '\t' => {
+                pending_whitespace.push((ch, byte_idx..next_byte));
+                idx += 1;
+            }
+            '\r' | '\n' => {
+                pending_whitespace.clear();
+
+                let newline_end = if ch == '\r' && chars.get(idx + 1).map(|(_, next_ch)| *next_ch) == Some('\n') {
+                    idx += 1;
+                    chars
+                        .get(idx + 1)
+                        .map(|(next_idx, _)| *next_idx)
+                        .unwrap_or_else(|| s.len())
+                } else {
+                    next_byte
+                };
+
+                push_normalized_char(&mut normalized, &mut ranges, '\n', byte_idx..newline_end);
+                idx += 1;
+            }
+            _ => {
+                for (pending_ch, pending_range) in pending_whitespace.drain(..) {
+                    push_normalized_char(&mut normalized, &mut ranges, pending_ch, pending_range);
+                }
+                push_normalized_char(&mut normalized, &mut ranges, ch, byte_idx..next_byte);
+                idx += 1;
+            }
+        }
+    }
+
+    (normalized, ranges)
+}
+
+fn push_normalized_char(
+    normalized: &mut String,
+    ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
+    ch: char,
+    original_range: std::ops::Range<usize>,
+) {
+    let normalized_byte = normalized.len();
+    normalized.push(ch);
+    ranges.push((normalized_byte, original_range));
+}
+
+fn normalized_match_to_original_range(
+    start: usize,
+    end: usize,
+    ranges: &[(usize, std::ops::Range<usize>)],
+) -> Option<std::ops::Range<usize>> {
+    let first_idx = ranges.iter().position(|(normalized_byte, _)| *normalized_byte == start)?;
+    let last_idx = ranges
+        .iter()
+        .enumerate()
+        .take_while(|(_, (normalized_byte, _))| *normalized_byte < end)
+        .map(|(idx, _)| idx)
+        .last()?;
+
+    Some(ranges[first_idx].1.start..ranges[last_idx].1.end)
+}
+
+fn backup_path(file_path: &std::path::Path) -> PathBuf {
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+
+    file_path.with_file_name(format!("{}.bak", file_name))
+}
+
+fn atomic_write(file_path: &std::path::Path, content: &str) -> Result<(), std::io::Error> {
+    let metadata = fs::metadata(file_path)?;
+    let permissions = metadata.permissions();
+    let temp_path = unique_temp_path(file_path);
+
+    fs::write(&temp_path, content)?;
+    fs::set_permissions(&temp_path, permissions)?;
+    fs::rename(&temp_path, file_path)?;
+
+    Ok(())
+}
+
+fn unique_temp_path(file_path: &std::path::Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+
+    file_path.with_file_name(format!("{}.tmp.{}", file_name, timestamp))
+}

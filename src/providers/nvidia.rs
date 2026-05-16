@@ -1,5 +1,5 @@
-//! NVIDIA API client para Rig - Implementación externa con tool calling
-//! Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
+//! NVIDIA API client para Rig - Implementación externa con tool calling.
+//! The endpoint is configured from `Config::nvidia_base_url`.
 
 use anyhow::Result;
 use rig::completion::{
@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::Future;
 use std::time::Duration;
+
+use rig::message::ToolChoice;
 
 // ==================== Client mínimo ====================
 #[derive(Clone)]
@@ -24,14 +26,14 @@ pub struct Client {
 impl Client {
     pub fn new(api_key: impl Into<String>) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("Failed to build reqwest client");
 
         Self {
             api_key: api_key.into(),
-            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            base_url: String::new(),
             http_client,
             ui_tx: None,
         }
@@ -62,7 +64,7 @@ impl Client {
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!(
             "{}/{}",
-            self.base_url.trim_end_matches('/'),
+            self.base_url.trim().trim_end_matches('/'),
             path.trim_start_matches('/')
         );
         self.http_client
@@ -165,117 +167,181 @@ impl rig::completion::CompletionModel for CompletionModel {
                 CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
             })?;
 
-            // ← FIX: self.client.log(), no self.log()
-            self.client.log("Sending request...");
+            let url = format!(
+                "{}/{}",
+                self.client.base_url.trim().trim_end_matches('/'),
+                "chat/completions"
+            );
 
-            let start = std::time::Instant::now();
-            let resp = self
-                .client
-                .post("chat/completions")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    self.client.log(&format!("Request failed: {}", e));
-                    CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
-                })?;
+            // ← Logging detallado del request
+            // self.client.log(&format!("POST {}", url));
+            // self.client.log(&format!(
+            //     "Model: {}, Tools: {}",
+            //     self.model,
+            //     request.tools.len()
+            // ));
 
-            let elapsed = start.elapsed();
-            // ← FIX: self.client.log()
-            self.client.log(&format!(
-                "Response in {:.1}s (status {})",
-                elapsed.as_secs_f64(),
-                resp.status()
-            ));
+            // ← Retry loop con backoff exponencial
+            let mut last_err = None;
+            for attempt in 0..3 {
+                let start = std::time::Instant::now();
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_else(|_| "Unknown".into());
-                self.client.log(&format!("HTTP error: {}", text));
-                return Err(CompletionError::ProviderError(format!(
-                    "HTTP {}: {}",
-                    status, text
-                )));
+                match self
+                    .client
+                    .http_client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.client.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let elapsed = start.elapsed();
+
+                        if !status.is_success() {
+                            let error_text =
+                                resp.text().await.unwrap_or_else(|_| "<no body>".into());
+                            self.client.log(&format!(
+                                "HTTP {} in {:.2}s: {}",
+                                status,
+                                elapsed.as_secs_f32(),
+                                error_text.chars().take(200).collect::<String>()
+                            ));
+
+                            // No reintentar errores 4xx (son del cliente)
+                            if status.is_client_error() {
+                                return Err(CompletionError::ProviderError(format!(
+                                    "HTTP {}: {}",
+                                    status, error_text
+                                )));
+                            }
+                            // Reintentar 5xx y errores de red
+                            last_err = Some(CompletionError::ProviderError(format!(
+                                "HTTP {}: {}",
+                                status, error_text
+                            )));
+                        } else {
+                            // Éxito: procesar respuesta
+                            let nvidia_resp: NvidiaResponse = resp.json().await.map_err(|e| {
+                                self.client.log(&format!("JSON parse error: {}", e));
+                                CompletionError::RequestError(
+                                    std::io::Error::other(e.to_string()).into(),
+                                )
+                            })?;
+
+                            self.client.log(&format!(
+                                "OK in {:.2}s ({} chars)",
+                                elapsed.as_secs_f32(),
+                                serde_json::to_string(&nvidia_resp)
+                                    .map(|s| s.len())
+                                    .unwrap_or(0)
+                            ));
+
+                            // ... (resto del procesamiento de respuesta, igual que antes) ...
+                            let message_id = nvidia_resp.id.clone();
+                            let first_choice = nvidia_resp.choices.first().ok_or_else(|| {
+                                CompletionError::ProviderError("No choices in response".into())
+                            })?;
+
+                            let choice_content = if let Some(tool_calls) =
+                                &first_choice.message.tool_calls
+                            {
+                                let tool_calls_rig: Vec<AssistantContent> = tool_calls
+                                    .iter()
+                                    .filter_map(|tc| {
+                                        let args: serde_json::Value =
+                                            serde_json::from_str(&tc.function.arguments).ok()?;
+                                        Some(AssistantContent::ToolCall(ToolCall {
+                                            id: tc.id.clone(),
+                                            call_id: Some(tc.id.clone()),
+                                            function: rig::message::ToolFunction::new(
+                                                tc.function.name.clone(),
+                                                args,
+                                            ),
+                                            signature: None,
+                                            additional_params: None,
+                                        }))
+                                    })
+                                    .collect();
+                                if tool_calls_rig.is_empty() {
+                                    let content =
+                                        first_choice.message.content.clone().unwrap_or_default();
+                                    vec![AssistantContent::Text(Text { text: content })]
+                                } else {
+                                    tool_calls_rig
+                                }
+                            } else {
+                                let content =
+                                    first_choice.message.content.clone().unwrap_or_default();
+                                vec![AssistantContent::Text(Text { text: content })]
+                            };
+
+                            return Ok(CompletionResponse {
+                                choice: rig::OneOrMany::many(choice_content).map_err(|_| {
+                                    CompletionError::ProviderError("Empty choice content".into())
+                                })?,
+                                usage: nvidia_resp.usage.as_ref().map_or(
+                                    rig::completion::Usage {
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        total_tokens: 0,
+                                        cached_input_tokens: 0,
+                                        cache_creation_input_tokens: 0,
+                                    },
+                                    |u| rig::completion::Usage {
+                                        input_tokens: u.prompt_tokens as u64,
+                                        output_tokens: u.completion_tokens as u64,
+                                        total_tokens: u.total_tokens as u64,
+                                        cached_input_tokens: 0,
+                                        cache_creation_input_tokens: 0,
+                                    },
+                                ),
+                                raw_response: nvidia_resp,
+                                message_id: Some(message_id),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let err_detail = format!("{:?}", e);
+                        self.client.log(&format!(
+                            "Request error (attempt {}/3): {}",
+                            attempt + 1,
+                            err_detail.chars().take(300).collect::<String>()
+                        ));
+
+                        // Clasificar error para decidir si reintentar
+                        if e.is_timeout() {
+                            self.client.log("  → Timeout, will retry");
+                        } else if e.is_connect() {
+                            self.client.log("  → Connection failed, will retry");
+                        } else if e.is_request() {
+                            self.client.log("  → Request error, will retry");
+                        } else {
+                            self.client.log(&format!("  → Error type: {:?}", e));
+                        }
+
+                        last_err = Some(CompletionError::RequestError(
+                            std::io::Error::other(e.to_string()).into(),
+                        ));
+                    }
+                }
+
+                // Backoff exponencial: 1s, 2s, 4s (solo si no es el último intento)
+                if attempt < 2 {
+                    let delay = std::time::Duration::from_secs(1 << attempt);
+                    self.client
+                        .log(&format!("Waiting {:?} before retry...", delay));
+                    tokio::time::sleep(delay).await;
+                }
             }
 
-            let nvidia_resp: NvidiaResponse = resp.json().await.map_err(|e| {
-                CompletionError::RequestError(std::io::Error::other(e.to_string()).into())
-            })?;
-
-            let message_id = nvidia_resp.id.clone();
-
-            let first_choice = nvidia_resp
-                .choices
-                .first()
-                .ok_or_else(|| CompletionError::ProviderError("No choices in response".into()))?;
-
-            if let Some(tool_calls) = &first_choice.message.tool_calls {
-                for tc in tool_calls {
-                    self.client.log(&format!(
-                        "Model requested tool: {}({})",
-                        tc.function.name,
-                        tc.function.arguments.chars().take(100).collect::<String>() // Primeros 100 chars
-                    ));
-                }
-            } else {
-                self.client.log("Model returned text response (no tools)");
-            }
-
-            let choice_content = if let Some(tool_calls) = &first_choice.message.tool_calls {
-                let tool_calls_rig: Vec<AssistantContent> = tool_calls
-                    .iter()
-                    .filter_map(|tc| {
-                        let args: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).ok()?;
-                        Some(AssistantContent::ToolCall(ToolCall {
-                            id: tc.id.clone(),
-                            call_id: None,
-                            function: rig::message::ToolFunction::new(
-                                tc.function.name.clone(),
-                                args,
-                            ),
-                            signature: None,
-                            additional_params: None,
-                        }))
-                    })
-                    .collect();
-
-                if tool_calls_rig.is_empty() {
-                    let content = first_choice.message.content.clone().unwrap_or_default();
-                    vec![AssistantContent::Text(Text { text: content })]
-                } else {
-                    tool_calls_rig
-                }
-            } else {
-                let content = first_choice.message.content.clone().unwrap_or_default();
-                vec![AssistantContent::Text(Text { text: content })]
-            };
-
-            // ← FIX: self.client.log()
-            self.client.log("Done.");
-
-            Ok(CompletionResponse {
-                choice: rig::OneOrMany::many(choice_content)
-                    .map_err(|_| CompletionError::ProviderError("Empty choice content".into()))?,
-                usage: nvidia_resp.usage.as_ref().map_or(
-                    rig::completion::Usage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_tokens: 0,
-                        cached_input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                    },
-                    |u| rig::completion::Usage {
-                        input_tokens: u.prompt_tokens as u64,
-                        output_tokens: u.completion_tokens as u64,
-                        total_tokens: u.total_tokens as u64,
-                        cached_input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                    },
-                ),
-                raw_response: nvidia_resp,
-                message_id: Some(message_id),
-            })
+            // Agotados los intentos
+            self.client.log("All retry attempts failed");
+            Err(last_err.unwrap_or_else(|| {
+                CompletionError::ProviderError("Unknown error after retries".into())
+            }))
         }
     }
 
@@ -316,7 +382,10 @@ fn build_nvidia_body(
                             messages.push(json!({ "role": "user", "content": text }));
                         }
                         UserContent::ToolResult(tr) => {
-                            let tool_call_id = tr.call_id.clone().unwrap_or_else(|| tr.id.clone());
+                            let tool_call_id = tr
+                                .call_id
+                                .clone()
+                                .unwrap_or_else(|| format!("fallback_{}", tr.id));
                             let result_text = tr
                                 .content
                                 .iter()
@@ -339,38 +408,39 @@ fn build_nvidia_body(
                 }
             }
             RigMessage::Assistant { content, .. } => {
-                let text = content
-                    .iter()
-                    .filter_map(|c| match c {
-                        AssistantContent::Text(Text { text }) => Some(text.clone()),
-                        AssistantContent::ToolCall(tc) => {
-                            tracing::debug!(
-                                "🔧 AssistantContent::ToolCall: name={}, id={}",
-                                tc.function.name,
-                                tc.id
-                            );
-                            None
-                        }
-                        other => {
-                            tracing::debug!(
-                                "⚠️ AssistantContent no-text: {:?}",
-                                std::mem::discriminant(other)
-                            );
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                messages.push(json!({ "role": "assistant", "content": text }));
-            }
-        }
-    }
+                let mut assistant_parts = Vec::new();
+                let mut tool_calls = Vec::new();
 
-    for (i, msg) in messages.iter().enumerate() {
-        if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                if content.is_empty() && role != "assistant" {
-                    tracing::warn!("⚠️ Message {} with role '{}' has empty content", i, role);
+                for c in content.iter() {
+                    match c {
+                        AssistantContent::Text(Text { text }) => {
+                            assistant_parts.push(text.clone());
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            assistant_parts.push(format!("[TOOL_CALL: {}]", tc.function.name));
+                            tool_calls.push(json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments.to_string()
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let text = assistant_parts.join("\n");
+
+                if tool_calls.is_empty() {
+                    messages.push(json!({ "role": "assistant", "content": text }));
+                } else {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": text,
+                        "tool_calls": tool_calls
+                    }));
                 }
             }
         }
@@ -403,7 +473,15 @@ fn build_nvidia_body(
     }
 
     if let Some(tool_choice) = &request.tool_choice {
-        body["tool_choice"] = serde_json::to_value(tool_choice)?;
+        let normalized_tool_choice = match tool_choice {
+            ToolChoice::Auto => json!("auto"),
+            ToolChoice::None => json!("none"),
+            ToolChoice::Specific { function_names } => {
+                json!({"type": "function", "function": {"name": function_names}})
+            }
+            ToolChoice::Required => json!("required"),
+        };
+        body["tool_choice"] = normalized_tool_choice;
     }
 
     if let Some(extra) = &request.additional_params {

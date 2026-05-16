@@ -1,5 +1,5 @@
 [package]
-name = "lite-agent"
+name = "rustclaw"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight agent with a rig, controlled embeddings, and extensible tools"
