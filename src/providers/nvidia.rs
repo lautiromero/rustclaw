@@ -1,6 +1,3 @@
-//! NVIDIA API client para Rig - Implementación externa con tool calling.
-//! The endpoint is configured from `Config::nvidia_base_url`.
-
 use anyhow::Result;
 use rig::completion::{
     CompletionError, CompletionRequest, CompletionResponse, Message as RigMessage,
@@ -50,7 +47,7 @@ impl Client {
     pub fn log(&self, msg: &str) {
         if let Some(tx) = &self.ui_tx {
             let _ = tx.send(crate::io::tui::app::UiEvent::ToolStatus {
-                name: "nvidia".into(),
+                name: "provider".into(),
                 message: msg.into(),
             });
         }
@@ -353,7 +350,7 @@ impl rig::completion::CompletionModel for CompletionModel {
     > + Send {
         async move {
             Err(CompletionError::ProviderError(
-                "Streaming not implemented for NVIDIA provider".into(),
+                "Streaming not implemented for provider".into(),
             ))
         }
     }

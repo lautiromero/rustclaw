@@ -5,7 +5,6 @@ use std::sync::Arc;
 use super::AppAgent;
 use crate::config::Config;
 use crate::context::vector_store::AppVectorStore;
-use crate::io::tui::app::UiEvent;
 use crate::memory::sqlite::MemoryDB;
 use crate::providers::nvidia;
 use crate::tools::ReadFileTool;
@@ -22,9 +21,9 @@ pub async fn build_agent<M>(
 where
     M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
-    // Custom NVIDIA-compatible client so we can inspect the final HTTP body in the chat.
-    let client = nvidia::Client::new(&config.nvidia_api_key)
-        .base_url(&config.nvidia_base_url)
+    // Custom openai-compatible client so we can inspect the final HTTP body in the chat.
+    let client = nvidia::Client::new(&config.openai_api_key)
+        .base_url(&config.openai_base_url)
         .with_ui_tx(ui_tx.clone());
     let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
 

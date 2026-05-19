@@ -2,7 +2,6 @@ use anyhow::Context;
 use clap::Parser;
 use std::sync::Arc;
 
-// ← AGREGAR: Trait para embedding_model()
 use rig::client::EmbeddingsClient;
 
 mod agent;
@@ -17,6 +16,7 @@ use agent::build_agent;
 use config::Config;
 use context::vector_store::AppVectorStore;
 use memory::sqlite::MemoryDB;
+use sqlx::migrate::Migrator;
 
 mod io {
     pub mod tui;
@@ -26,7 +26,7 @@ mod state {
 }
 
 #[derive(Parser)]
-#[command(name = "lite-agent")]
+#[command(name = "rustclaw")]
 struct Cli {
     #[arg(short, long)]
     doc_url: Option<String>,
@@ -58,12 +58,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to connect to database")?;
 
-    sqlx::migrate!("./migrations")
-        .run(memory_db.pool())
+    let migrations_path = Config::config_dir()
+        .map(|dir| dir.join("migrations"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./migrations"));
+
+    let mut conn = memory_db.pool().acquire().await?;
+    // Migrator::new(migrations_path)
+    //     .run(&mut conn)
+    //     .await
+    //     .context("Failed to run database migrations")?;
+
+    let migrator = sqlx::migrate::Migrator::new(migrations_path)
+        .await
+        .context("Failed to create migrator")?;
+    migrator
+        .run(&mut conn)
         .await
         .context("Failed to run database migrations")?;
 
-    tracing::info!("Database initialized and migrations applied");
+    // tracing::info!("Database initialized and migrations applied");
 
     let memory_db_arc = Arc::new(memory_db);
     let session_id = crate::io::tui::session_select::select_session(&memory_db_arc)?;
@@ -71,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Crear cliente de embeddings (para índice vectorial de docs/código)
     let embed_client = rig::providers::openai::Client::builder()
-        .api_key("") // llama.cpp ignora la key
+        .api_key("")
         .base_url(&config.embedding_base_url)
         .build()
         .context("Failed to create embeddings client")?;

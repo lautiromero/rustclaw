@@ -1,0 +1,22 @@
+# [database]
+url = "sqlite:data/agent.db?mode=rwc"
+
+[llm]
+openai_base_url = "http://localhost:20128/v1"
+model = "agent"
+
+[embedding]
+model = "snowflake-arctic-embed-m-v1.5-f16.gguf"
+base_url = "http://localhost:8082/v1"
+
+# [agent]
+# max_context = 3
+# max_turns = 25
+# timeout_base_secs = 30
+# max_context_messages = 20
+#
+# [security]
+# yolo = false
+#
+# [workspace]
+# workspaces = ["./workspace"]
