@@ -45,3 +45,17 @@ If the script is not executable, run:
 chmod +x install.sh
 ./install.sh
 ```
+
+6. Configure an OpenAI-compatible API endpoint in `~/.rustclaw/config.toml`:
+
+```toml
+[llm]
+openai_base_url = "http://localhost:8080/v1" # Ex: https://integrate.api.nvidia.com/v1
+model = "gpt-5.5"
+```
+
+7. Configure your API key in `~/.rustclaw/.env` if needed:
+
+```env
+OPENAI_API_KEY=your_api_key_here
+```
