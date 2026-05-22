@@ -83,12 +83,28 @@ src/
 
 ## Config relevante (config.rs)
 
-| Variable | Default | Descripción |
-|---|---|---|
-| `max_context_messages` | 20 | Últimos N mensajes enviados al agente (excluye system prompt) |
-| `max_turns` | 5 | Iteraciones internas máximas por mensaje del usuario |
-| `timeout_base_secs` | 40 | Timeout base por iteración (timeout total = base * max_turns) |
-| `max_context` | 3 | Documentos del dynamic context (RAG) |
+Config loading order:
+
+1. Loads `$HOME/.rustclaw/.env` if it exists; otherwise falls back to the project/local `.env`.
+2. Loads `$HOME/.rustclaw/config.toml` if it exists.
+3. Applies CLI overrides for supported flags.
+
+`config.toml` supports sectioned keys such as `[llm]`, `[embedding]`, `[database]`, `[agent]`, `[security]`, and `[workspace]`. Environment variables take precedence over file values. CLI flags take precedence for `yolo` and added workspaces.
+
+| Config field | Environment variable | config.toml key(s) | Default | Description |
+|---|---|---|---|---|
+| `openai_api_key` | `OPENAI_API_KEY` | `llm.openai_api_key` | required | OpenAI-compatible API key |
+| `openai_base_url` | `OPENAI_BASE_URL` | `llm.openai_base_url` | `https://api.openai.com/v1` | OpenAI-compatible LLM base URL |
+| `llm_model` | `LLM_MODEL` | `llm.model`, `agent.model` | `nvidia/llama-3.1-70b-instruct` | Chat/completion model |
+| `embedding_model` | `EMBEDDING_MODEL` | `embedding.model` | `text-embedding-3-small` | Embedding model |
+| `embedding_base_url` | `EMBEDDING_BASE_URL` | `embedding.base_url` | `http://localhost:8080/v1` | OpenAI-compatible embedding base URL |
+| `database_url` | `DATABASE_URL` | `database.url` | `sqlite:data/agent.db?mode=rwc` | Database URL; relative SQLite paths are resolved under `$HOME/.rustclaw` |
+| `max_context` | `MAX_CONTEXT` | `agent.max_context` | `3` | Dynamic context/RAG document count |
+| `max_turns` | `AGENT_MAX_TURNS` | `agent.max_turns` | `25` | Maximum internal turns per user message |
+| `timeout_base_secs` | `AGENT_TIMEOUT_BASE` | `agent.timeout_base_secs` | `30` | Base timeout per turn; total timeout = `timeout_base_secs * max_turns` |
+| `max_context_messages` | `MAX_CONTEXT_MESSAGES` | `agent.max_context_messages` | `20` | Last N messages sent to the agent, excluding the system prompt |
+| `yolo` | `RUSTCLAW_YOLO` | `security.yolo` | `false` | Filesystem/security bypass mode; can be overridden with `--yolo` or `--no-yolo` |
+| `workspaces` | — | `workspace.workspaces`, `workspaces` | `[]` | Allowed workspace paths; supports inline and multi-line TOML string arrays; CLI can append with `--add-workspace PATH` or `--add-workspace=PATH` |
 
 ## Tools del agente (builder.rs)
 
@@ -100,4 +116,4 @@ src/
 - `apply_diff` → aplica SEARCH/REPLACE diffs con backup .bak
 - `write_file` → crea archivos nuevos o sobrescribe con confirmación y backup .bak
 
-El preamble del agente incluye facts globales desde DB (`general_*`) y reglas breves: recall solo para temas específicos, responder en el idioma del usuario y evitar meta-comentarios/proceso. El LLM se instancia con `rig::providers::openai::CompletionsClient` apuntando a `NVIDIA_BASE_URL`; el cliente NVIDIA propio queda comentado.
+El preamble del agente incluye facts globales desde DB (`general_*`) y reglas breves: recall solo para temas específicos, responder en el idioma del usuario y evitar meta-comentarios/proceso. El LLM se instancia con `rig::providers::openai::CompletionsClient` apuntando a `OPENAI_BASE_URL`; el cliente NVIDIA propio queda comentado.

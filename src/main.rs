@@ -2,7 +2,9 @@ use anyhow::Context;
 use clap::Parser;
 use std::sync::Arc;
 
-use rig::client::EmbeddingsClient;
+// Embeddings are intentionally disabled for now.
+// Do not delete the code below; it is kept for future RAG/dynamic context support.
+// use rig::client::EmbeddingsClient;
 
 mod agent;
 mod config;
@@ -14,9 +16,10 @@ mod utils;
 
 use agent::build_agent;
 use config::Config;
-use context::vector_store::AppVectorStore;
+// Embeddings are intentionally disabled for now.
+// Do not delete the code below; it is kept for future RAG/dynamic context support.
+// use context::vector_store::AppVectorStore;
 use memory::sqlite::MemoryDB;
-use sqlx::migrate::Migrator;
 
 mod io {
     pub mod tui;
@@ -80,25 +83,35 @@ async fn main() -> anyhow::Result<()> {
 
     let memory_db_arc = Arc::new(memory_db);
     let session_id = crate::io::tui::session_select::select_session(&memory_db_arc)?;
-    let vector_store = AppVectorStore::new_in_memory();
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // let vector_store = AppVectorStore::new_in_memory();
 
-    // Crear cliente de embeddings (para índice vectorial de docs/código)
-    let embed_client = rig::providers::openai::Client::builder()
-        .api_key("")
-        .base_url(&config.embedding_base_url)
-        .build()
-        .context("Failed to create embeddings client")?;
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // Create embeddings client for vector document/code indexing.
+    // let embed_client = rig::providers::openai::Client::builder()
+    //     .api_key("")
+    //     .base_url(&config.embedding_base_url)
+    //     .build()
+    //     .context("Failed to create embeddings client")?;
 
-    let embed_model = embed_client.embedding_model(&config.embedding_model);
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // let embed_model = embed_client.embedding_model(&config.embedding_model);
 
     let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Construir agente (ahora es async)
     let agent = build_agent(
         &config,
-        vector_store,
+        // Embeddings are intentionally disabled for now.
+        // Do not delete the code below; it is kept for future RAG/dynamic context support.
+        // vector_store,
         memory_db_arc.clone(),
-        embed_model,
+        // Embeddings are intentionally disabled for now.
+        // Do not delete the code below; it is kept for future RAG/dynamic context support.
+        // embed_model,
         session_id.clone(),
         Some(ui_tx.clone()),
     )

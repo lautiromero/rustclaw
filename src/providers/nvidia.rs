@@ -228,13 +228,13 @@ impl rig::completion::CompletionModel for CompletionModel {
                                 )
                             })?;
 
-                            self.client.log(&format!(
-                                "OK in {:.2}s ({} chars)",
-                                elapsed.as_secs_f32(),
-                                serde_json::to_string(&nvidia_resp)
-                                    .map(|s| s.len())
-                                    .unwrap_or(0)
-                            ));
+                            // self.client.log(&format!(
+                            //     "OK in {:.2}s ({} chars)",
+                            //     elapsed.as_secs_f32(),
+                            //     serde_json::to_string(&nvidia_resp)
+                            //         .map(|s| s.len())
+                            //         .unwrap_or(0)
+                            // ));
 
                             // ... (resto del procesamiento de respuesta, igual que antes) ...
                             let message_id = nvidia_resp.id.clone();

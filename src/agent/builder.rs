@@ -4,22 +4,26 @@ use std::sync::Arc;
 
 use super::AppAgent;
 use crate::config::Config;
-use crate::context::vector_store::AppVectorStore;
+// Embeddings are intentionally disabled for now.
+// Do not delete the code below; it is kept for future RAG/dynamic context support.
+// use crate::context::vector_store::AppVectorStore;
 use crate::memory::sqlite::MemoryDB;
 use crate::providers::nvidia;
 use crate::tools::ReadFileTool;
 use crate::tools::memory::{recall::RecallTool, save_fact::SaveFactTool};
 
-pub async fn build_agent<M>(
+pub async fn build_agent(
     config: &Config,
-    vector_store: AppVectorStore,
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // vector_store: AppVectorStore,
     memory_db: Arc<MemoryDB>,
-    embed_model: M,
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // embed_model: M,
     session_id: String,
     ui_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::io::tui::app::UiEvent>>,
 ) -> Result<AppAgent>
-where
-    M: rig::embeddings::EmbeddingModel + Clone + Send + Sync + 'static,
 {
     // Custom openai-compatible client so we can inspect the final HTTP body in the chat.
     let client = nvidia::Client::new(&config.openai_api_key)
@@ -27,8 +31,10 @@ where
         .with_ui_tx(ui_tx.clone());
     let llm_model = nvidia::CompletionModel::new(client, &config.llm_model);
 
-    // Índice para docs/código (rig.dynamic_context)
-    let index = vector_store.index(embed_model);
+    // Embeddings are intentionally disabled for now.
+    // Do not delete the code below; it is kept for future RAG/dynamic context support.
+    // Index for docs/code (rig.dynamic_context).
+    // let index = vector_store.index(embed_model);
 
     // 1. Cargar facts GLOBALES (general_*) → se inyectan en el preamble, aplican SIEMPRE
     let global_facts = sqlx::query_as::<_, (String, String)>(
@@ -79,7 +85,9 @@ Persistent global facts:
 
     let agent = rig::agent::AgentBuilder::new(llm_model)
         .preamble(&preamble)
-        .dynamic_context(config.max_context, index)
+        // Embeddings are intentionally disabled for now.
+        // Do not delete the code below; it is kept for future RAG/dynamic context support.
+        // .dynamic_context(config.max_context, index)
         .temperature(0.2)
         .max_tokens(8000)
         .additional_params(json!({"top_p": 0.9}))
