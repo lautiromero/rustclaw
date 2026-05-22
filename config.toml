@@ -1,22 +1,24 @@
 # [database]
-url = "sqlite:data/agent.db?mode=rwc"
+# url = "sqlite:data/agent.db?mode=rwc"
 
 [llm]
-openai_base_url = "http://localhost:20128/v1"
-model = "agent"
+openai_base_url = "http://localhost:20128/v1" # Ex: https://integrate.api.nvidia.com/v1
+model = "stepfun-ai/step-3.5-flash" # Ex: gpt-5.5
 
+# This hasn't been implemented yet; the embedding settings aren't taking effect.
 [embedding]
-model = "snowflake-arctic-embed-m-v1.5-f16.gguf"
 base_url = "http://localhost:8082/v1"
+model = "snowflake-arctic-embed-m-v1.5-f16.gguf"
 
 # [agent]
-# max_context = 3
-# max_turns = 25
-# timeout_base_secs = 30
-# max_context_messages = 20
+max_context = 3 # Max documents attached for rag, not implemented yet.
+max_turns = 25 # Max number of internal interactions by the agent
+timeout_base_secs = 30 # Timeout for each interaction based on the maximum number of interactions, calculated as: max_turns * timeout_base_sec
+max_context_messages = 20 # the last X messages that will be sent to the model, to prevent the context from becoming infinite.
 #
+# The settings below have not yet been implemented and have no effect.
 # [security]
 # yolo = false
-#
+# 
 # [workspace]
 # workspaces = ["./workspace"]
